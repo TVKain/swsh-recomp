@@ -40,16 +40,30 @@ static int16_t def_pad(int layout, int slot) {
     return k_def_pad[slot];
 }
 int bind_layout(void) { return g_layout; }
+// The choice (larecomp.ini controller_layout): Automatic (the default) follows the controller in use - a Switch Pro /
+// Joy-Con: Nintendo, anything else (Xbox, PlayStation, handhelds as the MSI Claw / Steam Deck / ROG Ally): Xbox, A on
+// the bottom button as printed - or one of the three fixed.
+static int g_pref = BIND_LAYOUT_AUTO, g_auto = BIND_LAYOUT_NINTENDO;  // (g_auto: the last controller's)
+int bind_layout_pref(void) { return g_pref; }
 // A / B and X / Y follow the layout where they are still at the old one's defaults (a remap of the Controls page stays)
-void bind_set_layout(int layout) {
-    if (layout != BIND_LAYOUT_XBOX && layout != BIND_LAYOUT_WESTERN) layout = BIND_LAYOUT_NINTENDO;
+static void apply_layout(int layout) {
     if (layout == g_layout) return;
     for (int i = 0; i < 4; i++)
         if (g_bind_pad[i] == def_pad(g_layout, i)) g_bind_pad[i] = def_pad(layout, i);
     g_layout = layout;
-    LOG("[input] controller layout: %s\n", layout == BIND_LAYOUT_XBOX ? "Xbox (A bottom, B right, X left, Y top)"
-                                           : layout == BIND_LAYOUT_WESTERN ? "Western (A bottom, B right, X top, Y left)"
-                                                                           : "Nintendo (A right, B bottom)");
+    LOG("[input] controller layout: %s%s\n", layout == BIND_LAYOUT_XBOX ? "Xbox (A bottom, B right, X left, Y top)"
+                                             : layout == BIND_LAYOUT_WESTERN ? "Western (A bottom, B right, X top, Y left)"
+                                                                             : "Nintendo (A right, B bottom)",
+        g_pref == BIND_LAYOUT_AUTO ? " - automatic" : "");
+}
+void bind_set_layout(int layout) {
+    if (layout != BIND_LAYOUT_XBOX && layout != BIND_LAYOUT_WESTERN && layout != BIND_LAYOUT_NINTENDO) layout = BIND_LAYOUT_AUTO;
+    g_pref = layout;
+    apply_layout(layout == BIND_LAYOUT_AUTO ? g_auto : layout);
+}
+void bind_pad_kind(bool nintendo) {
+    g_auto = nintendo ? BIND_LAYOUT_NINTENDO : BIND_LAYOUT_XBOX;
+    if (g_pref == BIND_LAYOUT_AUTO) apply_layout(g_auto);
 }
 int16_t g_bind_pad[BIND_PAD_COUNT] = DEF_PAD, g_bind_key[BIND_KEY_COUNT] = DEF_KEY;
 const int16_t g_bind_key2[BIND_PAD_COUNT] = {SDL_SCANCODE_RETURN, SDL_SCANCODE_BACKSPACE};
@@ -232,8 +246,11 @@ bool bind_capture_event(const SDL_Event *e) {
 
 // ------------------------------------------------------------------ larecomp.ini
 bool bind_settings_load(const char *key, const char *val) {
-    if (!strcmp(key, "pad_layout")) {
-        bind_set_layout(!strcmp(val, "xbox") ? BIND_LAYOUT_XBOX : !strcmp(val, "western") ? BIND_LAYOUT_WESTERN : BIND_LAYOUT_NINTENDO);
+    // (pad_layout: from before Automatic, always written - its "nintendo" was only the default: Automatic now)
+    if (!strcmp(key, "controller_layout") || !strcmp(key, "pad_layout")) {
+        bool legacy = key[0] == 'p';
+        bind_set_layout(!strcmp(val, "xbox") ? BIND_LAYOUT_XBOX : !strcmp(val, "western") ? BIND_LAYOUT_WESTERN
+                        : !strcmp(val, "nintendo") && !legacy ? BIND_LAYOUT_NINTENDO : BIND_LAYOUT_AUTO);
         return true;
     }
     bool pad = !strncmp(key, "bind_pad_", 9), kb = !strncmp(key, "bind_key_", 9);
@@ -252,7 +269,8 @@ bool bind_settings_load(const char *key, const char *val) {
 }
 
 void bind_settings_save(FILE *f) {
-    fprintf(f, "pad_layout = %s\n", g_layout == BIND_LAYOUT_XBOX ? "xbox" : g_layout == BIND_LAYOUT_WESTERN ? "western" : "nintendo");  // (before the bind_pad_ lines)
+    fprintf(f, "controller_layout = %s\n", g_pref == BIND_LAYOUT_XBOX ? "xbox" : g_pref == BIND_LAYOUT_WESTERN ? "western"
+            : g_pref == BIND_LAYOUT_NINTENDO ? "nintendo" : "auto");  // (before the bind_pad_ lines)
     for (int i = 0; i < BIND_PAD_COUNT; i++)
         if (g_bind_pad[i] != def_pad(g_layout, i) && g_bind_pad[i] >= 0 && g_bind_pad[i] < PADB_HOST_COUNT)
             fprintf(f, "bind_pad_%s = %s\n", k_ini[i], k_pad_ini[g_bind_pad[i]]);

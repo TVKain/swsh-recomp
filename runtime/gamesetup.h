@@ -17,6 +17,7 @@ enum {
     SETUP_READING,      // generator: translating the game code
     SETUP_COMPILING,    // compiler
     SETUP_FINISHING,    // linking
+    SETUP_UNPACKING,    // unpacking .xci / .nsp with nstool
     SETUP_DONE,         // ready to play
     // failures (setup_state)
     SETUP_FAIL_NOT_FOUND,   // no exefs/main + romfs in that folder
@@ -26,7 +27,11 @@ enum {
     SETUP_FAIL_BUILD,       // the game code didn't build
     SETUP_FAIL_TOOLS,       // the generator / compiler are missing from this copy
     SETUP_FAIL_IMAGE,       // the game data image (romfs.bin) isn't a whole RomFS the game can read
+    SETUP_FAIL_KEYS,        // packages picked, no prod.keys found
+    SETUP_FAIL_UNPACK,      // nstool missing or failed (unpack.log)
+    SETUP_FAIL_NO_BASE,     // only an update / DLC picked, not the game itself
 };
+#define MAX_PICK 8192  // setup_start's argument: a folder, or package files one per line
 
 // The game files in <data root>/extracted: ready to play (exefs, romfs.bin and game code built for this version).
 bool setup_ready(void);
@@ -47,7 +52,9 @@ enum { GAME_BUILD_OTHER, GAME_BUILD_EEVEE_100, GAME_BUILD_PIKACHU_100 };
 int game_build(const char *exefs);
 // Its version ("1.0.0", "1.0.2"...: the builds known by their build id; "1.0.0" otherwise), told to the game (am).
 const char *game_version(const char *exefs);
-// Starts a setup from the picked folder (NULL: only rebuild the game code from files set up already).
+// Starts a setup from the picked folder, or from .xci / .nsp files (one path per line: the game, its update, DLC;
+// unpacked with nstool). NULL: only rebuild the game code from files set up already. A folder without extracted
+// files but with .xci / .nsp in it is unpacked too.
 void setup_start(const char *folder);
 int setup_state(void);         // SETUP_*
 float setup_progress(void);    // 0..1 while running

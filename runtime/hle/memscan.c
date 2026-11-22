@@ -60,6 +60,11 @@ static DWORD WINAPI scan_thread(LPVOID unused) {
     LOG("[scan] scanning at present %llu for %zu bytes\n", (unsigned long long)renderer_game_frame(), g_patlen);
     each_region(scan_region, &s);
     LOG("[scan] %d hit(s)\n", s.nhits);
+    if (getenv("LARECOMP_SCAN_WATCH")) {  // =<n>: watch who writes the first n hits from now on (hle/memwatch.c)
+        extern void memwatch_add(uint64_t addr);
+        int n = atoi(getenv("LARECOMP_SCAN_WATCH"));
+        for (int i = 0; i < s.nhits && i < n; i++) memwatch_add(s.hits[i]);
+    }
     for (int i = 0; i < s.nhits; i++) {
         uint64_t h = s.hits[i];
         if (g_back > 0) {
@@ -77,6 +82,70 @@ static DWORD WINAPI scan_thread(LPVOID unused) {
     }
     LOG("[scan] done\n");
     return 0;
+}
+
+// LARECOMP_PEEK="<addr>:<len>[,<addr>:<len>...]@<first>-<last>" (research): each present in that range, the bytes of
+// those guest ranges are logged as 32-bit words ("[peek] f<present> <addr>+<off>: ..."), to diff which field moves
+// frame by frame (read from a polling thread: a value can be caught mid-update).
+static uint64_t g_peek_a[16], g_peek_n[16];
+static int g_npeek;
+static long g_peek_first, g_peek_last;
+static DWORD WINAPI peek_thread(LPVOID unused) {
+    (void)unused;
+    long last = -1;
+    for (;;) {
+        long f = (long)renderer_game_frame();
+        if (f > g_peek_last) break;
+        if (f >= g_peek_first && f != last) {
+            last = f;
+            for (int i = 0; i < g_npeek; i++)
+                for (uint64_t o = 0; o < g_peek_n[i]; o += 32) {
+                    char line[256];
+                    int n = snprintf(line, sizeof line, "[peek] f%ld %llx+%03llx:", f, (unsigned long long)g_peek_a[i], (unsigned long long)o);
+                    for (uint64_t k = 0; k < 32 && o + k < g_peek_n[i]; k += 4)
+                        n += snprintf(line + n, sizeof line - n, " %08x", *(const volatile uint32_t *)(uintptr_t)(g_peek_a[i] + o + k));
+                    LOG("%s\n", line);
+                }
+        }
+        Sleep(0);
+    }
+    return 0;
+}
+
+// LARECOMP_WATCH_FROM="<present>:<addr>[,<addr>...]" (research): memwatch (hle/memwatch.c) those words from that present
+// on: heap objects that exist only later (LARECOMP_WATCH from the start finds their pages unmapped).
+static DWORD WINAPI watch_from_thread(LPVOID arg) {
+    const char *e = arg;
+    long at = atol(e);
+    while ((long)renderer_game_frame() < at) Sleep(1);
+    extern void memwatch_add(uint64_t addr);
+    for (const char *p = strchr(e, ':'); p && *p; p = strchr(p, ',')) {
+        p++;
+        memwatch_add(strtoull(p, NULL, 16));
+    }
+    return 0;
+}
+
+__attribute__((constructor)) static void watch_from_init(void) {
+    const char *e = getenv("LARECOMP_WATCH_FROM");
+    if (e && strchr(e, ':')) CreateThread(NULL, 0, watch_from_thread, (LPVOID)e, 0, NULL);
+}
+
+__attribute__((constructor)) static void peek_init(void) {
+    const char *e = getenv("LARECOMP_PEEK");
+    if (!e) return;
+    const char *at = strchr(e, '@');
+    if (!at) return;
+    sscanf(at + 1, "%ld-%ld", &g_peek_first, &g_peek_last);
+    for (const char *p = e; p < at && g_npeek < 16;) {
+        unsigned long long a, n;
+        if (sscanf(p, "%llx:%llx", &a, &n) != 2) break;
+        g_peek_a[g_npeek] = a, g_peek_n[g_npeek] = n, g_npeek++;
+        const char *c = strchr(p, ',');
+        if (!c || c > at) break;
+        p = c + 1;
+    }
+    if (g_npeek) CreateThread(NULL, 0, peek_thread, NULL, 0, NULL);
 }
 
 __attribute__((constructor)) static void memscan_init(void) {

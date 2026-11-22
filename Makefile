@@ -2,7 +2,7 @@
 # Windows (the supported platform): MSYS2 UCRT64 shell or Git Bash with MSYS2 on PATH, clang + Vulkan renderer
 # (docs/COMPILAR-WINDOWS.md). The Linux branch is LAS Recomp's, kept but untested here.
 #   make gen           translate your own game files (extracted/exefs) into generated/
-#   make -j20          build/lasrecomp.exe (runtime) and build/lasgame.dll (the game code)
+#   make -j20          build/PokemonSword.exe (runtime) and build/lasgame.dll (the game code)
 #   make jogo          a copy to play while build/ is rebuilt (build/jogo/)
 #   make dist          the release zip (build/dist/SwShRecomp-<version>-windows.zip): needs make deps-windows,
 #                      make gen-helper and tools/fetch_zig.sh first
@@ -32,8 +32,8 @@ endif
 # B: build dir. DEPS: a prefix with SDL3 / FFmpeg to use instead of the system's (MSYS2's).
 B         ?= build
 DEPS      ?=
-# EXE_NAME: the exe's name (the release's: SwShRecomp); the game code library imports from the exe by it
-EXE_NAME  ?= lasrecomp
+# EXE_NAME: the exe's name; the game code library imports from the exe by it (changing it: relink build/lasgame.dll)
+EXE_NAME  ?= PokemonSword
 CC       := clang $(CROSS)
 CXX      := clang++ $(CROSS)
 IMGUI    := third_party/imgui
@@ -202,7 +202,7 @@ $(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc docs/icon/icon.ico ru
 	@mkdir -p $(dir $@)
 	$(WINDRES) -I docs/icon -I runtime/platform -O coff $< -o $@
 
-# Windows release: build/dist/SwShRecomp-<version>-windows.zip, top folder "SwShRecomp/": SwShRecomp.exe, the
+# Windows release: build/dist/PokemonSword-<version>-windows.zip, top folder "PokemonSword/": PokemonSword.exe, the
 # DLLs it loads (runs without MSYS2) and what its start screen builds the game code with on the player's machine
 # (runtime/gamebuild.c): the frozen generator (make gen-helper), zig (tools/fetch_zig.sh slimmed by tools/zig_slim.sh:
 # its runtime built ahead of time), gamelib-src/ and the exe's import library. No game code, no game files. The exe is
@@ -210,7 +210,7 @@ $(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc docs/icon/icon.ico ru
 # without a console window (RELEASE=1: the log goes to lasrecomp.log next to the exe). vulkan-1.dll is left out: every
 # Vulkan driver installs the loader in System32. Saves, settings, game files and mods go next to the exe at run time.
 VERSION  := $(shell sed -n 's/^\#define RT_APP_VERSION "\(.*\)".*/\1/p' runtime/paths.h)
-DIST     := build/dist/SwShRecomp
+DIST     := build/dist/PokemonSword
 WIN_B    := build/win-release
 deps-windows:
 	tools/build_deps_windows.sh
@@ -218,10 +218,10 @@ dist:
 	@[ -f build/deps-win/lib/libavcodec.dll.a ] || { echo "make deps-windows first (LGPL FFmpeg)"; exit 1; }
 	@[ -d build/helper/lasgen ] || { echo "make gen-helper first (the game code generator)"; exit 1; }
 	@[ -x build/zig/zig.exe ] || { echo "tools/fetch_zig.sh first (the compiler)"; exit 1; }
-	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win RELEASE=1 EXE_NAME=SwShRecomp $(WIN_B)/SwShRecomp.exe
+	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win RELEASE=1 EXE_NAME=PokemonSword $(WIN_B)/PokemonSword.exe
 	! nm $(WIN_B)/SwShRecomp.exe | grep ' f_70' >/dev/null  # (no game code inside)
 	rm -rf build/dist && mkdir -p "$(DIST)/gamelib-src"
-	cp $(WIN_B)/SwShRecomp.exe $(WIN_B)/lasrecomp.dll.a "$(DIST)/"
+	cp $(WIN_B)/PokemonSword.exe $(WIN_B)/lasrecomp.dll.a "$(DIST)/"
 	tools/zig_slim.sh $(strip $(filter-out -Iruntime,$(GENFLAGS)))  # (zig with its runtime built ahead of time)
 	cp -R build/helper/lasgen "$(DIST)/"
 	cp -R build/zig-slim "$(DIST)/zig"
@@ -233,14 +233,18 @@ dist:
 	cp LICENSE "$(DIST)/LICENSE.txt"
 	cp LICENSE-LASRecomp "$(DIST)/LICENSE-LASRecomp.txt"
 	cp docs/release-README.txt "$(DIST)/README.txt"
+	# nstool (MIT, jakcron) and the console keys: the start screen unpacks .xci / .nsp with them (runtime/gamesetup.c).
+	# PRIVATE FORK ONLY: third_party/nstool/prod.keys must never go into a public release or repository.
+	cp third_party/nstool/nstool.exe "$(DIST)/"
+	if [ -f third_party/nstool/prod.keys ]; then cp third_party/nstool/prod.keys "$(DIST)/"; fi
 	# NVIDIA's DLSS model (DLAA: runtime/nvn/vulkan/dlss.c), redistributed as NVIDIA's DLSS SDK allows; not in git
 	# (58 MB): put nvngx_dlss.dll in build/dlss/ before `make dist`, or the release goes without it (TAA instead)
 	if [ -f build/dlss/nvngx_dlss.dll ]; then cp build/dlss/nvngx_dlss.dll "$(DIST)/"; else echo "(no build/dlss/nvngx_dlss.dll: DLAA left out)"; fi
-	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/SwShRecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
+	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/PokemonSword.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
 	    xargs -I{} cp -u {} "$(DIST)/"
 	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)
-	cd build/dist && zip -qr "SwShRecomp-$(VERSION)-windows.zip" SwShRecomp
-	@echo "build/dist/SwShRecomp-$(VERSION)-windows.zip"
+	cd build/dist && zip -qr "PokemonSword-$(VERSION)-windows.zip" PokemonSword
+	@echo "build/dist/PokemonSword-$(VERSION)-windows.zip"
 
 # The game code generator as a standalone helper, so players need no Python (tools/lasgen.spec): build/helper/lasgen/,
 # shipped as lasgen/ next to the exe. The start screen's setup runs it on the player's own game files.

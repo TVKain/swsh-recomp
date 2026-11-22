@@ -61,8 +61,10 @@ int bind_pad_from_name(const char *name);
 // Button prompts (runtime/nvn/texpatch.c): the controller button now driving Switch input `slot` (BIND_A..)
 int bind_prompt_host(int slot);
 // Controller layout: which buttons are A / B / X / Y by default (launcher, Game page; larecomp.ini pad_layout)
-enum { BIND_LAYOUT_NINTENDO = 0, BIND_LAYOUT_XBOX = 1, BIND_LAYOUT_WESTERN = 2 };
-int bind_layout(void);
+enum { BIND_LAYOUT_NINTENDO = 0, BIND_LAYOUT_XBOX = 1, BIND_LAYOUT_WESTERN = 2, BIND_LAYOUT_AUTO = 3 };
+int bind_layout(void);       // the one in use (Automatic: the controller's)
+int bind_layout_pref(void);  // the choice: BIND_LAYOUT_AUTO or a fixed one
+void bind_pad_kind(bool nintendo);  // (runtime/hle/input.c: the controller in use is a Switch one or not)
 void bind_set_layout(int layout);  // A / B and X / Y still at the old layout's defaults move to the new one's
 
 #ifdef __cplusplus

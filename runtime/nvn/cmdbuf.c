@@ -544,7 +544,24 @@ NVN(nvnCommandBufferTiledDownsample) { (void)c; }
 NVN(nvnCommandBufferTiledDownsampleTextureView) { (void)c; }
 NVN(nvnCommandBufferResolveDepthBuffer) { (void)c; }
 // UpdateUniformBuffer(cmd, buffer, size, offset, dataSize, data)
-NVN(nvnCommandBufferUpdateUniformBuffer) { record_copy(c, CMD_UPDATE_UNIFORM_BUFFER, 5, (uint32_t)A(4)); }
+NVN(nvnCommandBufferUpdateUniformBuffer) {
+    // LARECOMP_LOG_UBO=<present>:<size> (research): from that present, each update of that many bytes with its caller and
+    // first words (who builds a draw's constants: the crowd's flipbook time)
+    static long lu_from = -2, lu_size;
+    if (lu_from == -2) { const char *e = getenv("LARECOMP_LOG_UBO"); lu_from = -1; if (e) sscanf(e, "%ld:%ld", &lu_from, &lu_size); }
+    if (lu_from >= 0 && (long)A(4) == lu_size) {
+        extern uint64_t renderer_game_frame(void);
+        static int n;
+        if ((long)renderer_game_frame() >= lu_from && n < 400) {
+            n++;
+            const float *d = (const float *)(uintptr_t)A(5);
+            LOG("[ubo] f%llu lr %llx dst %llx+%llx src %llx: %g %g %g %g %g %g\n", (unsigned long long)renderer_game_frame(),
+                (unsigned long long)c->x[30], (unsigned long long)A(1), (unsigned long long)A(3), (unsigned long long)A(5),
+                d[0], d[1], d[2], d[3], d[4], d[5]);
+        }
+    }
+    record_copy(c, CMD_UPDATE_UNIFORM_BUFFER, 5, (uint32_t)A(4));
+}
 
 // ---- synchronization and misc
 NVN(nvnCommandBufferFenceSync) {

@@ -45,3 +45,7 @@ __pycache__/
 
 # Estado local do supervisor de engenharia (tools/agent/supervisor.py): não vai para o repositório público
 .agent/
+
+# Local leftovers: ini backups, comparison screenshots (game images) at the repo root
+larecomp.ini.*
+/*.png

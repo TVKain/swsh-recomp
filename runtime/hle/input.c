@@ -234,6 +234,11 @@ static void note_family(void) {
     }
     if (f != pad_family) LOG("[input] button prompts: %s controller\n", f == 1 ? "Xbox" : f == 2 ? "PlayStation" : "Nintendo / other");
     pad_family = f;
+    if (pad && !getenv("LARECOMP_INPUT") && !getenv("LARECOMP_HOST_INPUT")) {  // (Automatic layout; scripted runs keep Nintendo)
+        SDL_GamepadType t = SDL_GetGamepadType(pad);
+        bind_pad_kind(t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO || t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT ||
+                      t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT || t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR);
+    }
 }
 int input_pad_family(void) {
     static int env = -2;
@@ -660,6 +665,15 @@ static void fill_state(Cpu *c) {
     if (ry > 16000) b |= 1ull << 21;
     if (rx > 16000) b |= 1ull << 22;
     if (ry < -16000) b |= 1ull << 23;
+    {   // Sword at 60 in a battle: the battle runs on even updates only (hle/swsh60.c btltask_hook); a change first seen
+        // on an odd update would be "held", not "pressed", by the time the battle reads it. Odd updates repeat the
+        // even update's state, so every press / release reaches the game on an even update.
+        extern bool swsh60_battle_paced(void);
+        extern uint64_t renderer_game_frame(void);
+        static uint64_t hb; static int32_t hlx, hly, hrx, hry;
+        if (swsh60_battle_paced() && (renderer_game_frame() & 1)) b = hb, lx = hlx, ly = hly, rx = hrx, ry = hry;
+        else hb = b, hlx = lx, hly = ly, hrx = rx, hry = ry;
+    }
     *(uint64_t *)(s + 8) = b;
     static uint64_t last_b;
     if (b != last_b && getenv("LARECOMP_INPUT")) LOG("[input] id %#x buttons %#llx (sampling %lld, lr %llx)\n", id, (unsigned long long)b, (long long)sampling, c->x[30]);
@@ -812,6 +826,13 @@ HLE_FUNC("_ZN2nn3hid20GetTouchScreenStatesILm16EEEiPNS0_16TouchScreenStateIXT_EE
     if (count <= 0) { c->x[0] = 0; return; }
     int32_t x, y;
     bool down = touch_now(&x, &y);
+    {   // (battle at 60: odd updates repeat the even update's finger - see fill_state)
+        extern bool swsh60_battle_paced(void);
+        extern uint64_t renderer_game_frame(void);
+        static bool hd; static int32_t hx, hy;
+        if (swsh60_battle_paced() && (renderer_game_frame() & 1)) down = hd, x = hx, y = hy;
+        else hd = down, hx = x, hy = y;
+    }
     // The release sample keeps the finger where it was: the game checks every sample's position (finger id -> x, y),
     // and a release reported elsewhere (the test's default, the mouse while the controller's finger let go) took the
     // touch off an on-screen button before it ended - the berry button never opened.

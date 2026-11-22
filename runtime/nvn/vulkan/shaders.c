@@ -537,6 +537,30 @@ static const char *builtin_src(const char *name, int *stage) {
     // Colour adjustment (F12 menu: runtime/ui/settings_ui.mm; Let's Go Recomp 0.6.0's), on the gamma-encoded image.
     // a = (brightness, contrast, saturation): brightness scales, contrast pivots around mid-grey, saturation mixes with
     // the Rec. 709 luma.
+    // Soft outlines (exec.c outline_soft): t0 = the scene before Sword's outline pass, t1 = after. The outline's darkening
+    // (1 - after / before, per channel) is spread over a 3x3 kernel (a.x centre, a.y edges, a.z corners, times a.w) and
+    // applied to the scene before: each hard 1-pixel step becomes a gradient, like an anti-aliased line.
+    if (!strcmp(name, "outline_soft.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t0;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D t1;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 dark(ivec2 p) {\n"
+               "  p = clamp(p, ivec2(0), ivec2(pc.b.xy) - 1);\n"
+               "  vec3 a = max(texelFetch(t0, p, 0).rgb, vec3(1e-5)), b = texelFetch(t1, p, 0).rgb;\n"
+               "  return clamp(1.0 - b / a, 0.0, 1.0);\n"
+               "}\n"
+               "void main() {\n"
+               "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+               "  vec3 k = dark(p) * pc.a.x\n"
+               "         + (dark(p + ivec2(1, 0)) + dark(p - ivec2(1, 0)) + dark(p + ivec2(0, 1)) + dark(p - ivec2(0, 1))) * pc.a.y\n"
+               "         + (dark(p + ivec2(1, 1)) + dark(p - ivec2(1, 1)) + dark(p + ivec2(1, -1)) + dark(p + ivec2(-1, 1))) * pc.a.z;\n"
+               "  vec4 a = texelFetch(t0, p, 0);\n"
+               "  o = vec4(a.rgb * (1.0 - clamp(k * pc.a.w, 0.0, 1.0)), texelFetch(t1, p, 0).a);\n"
+               "}\n";
+    }
     if (!strcmp(name, "color.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"

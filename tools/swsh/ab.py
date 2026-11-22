@@ -1,6 +1,6 @@
 """ab.py: interleaved A/B of two runtime builds (or two environments) on one scenario.
 
-  python tools/swsh/ab.py <scenario> --a build/ab/base/lasrecomp.exe --b build/v132/lasrecomp.exe
+  python tools/swsh/ab.py <scenario> --a build/ab/base/PokemonSword.exe --b build/v132/PokemonSword.exe
                           [--profile 1440p60] [--runs 3] [--b-env VAR=x ...] [--a-env VAR=x ...] [--label kwait]
 
 Runs A, B, A, B... (the frame time of the same scene drifts between runs, so only runs taken in turn compare), each

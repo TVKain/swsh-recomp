@@ -11,12 +11,14 @@
 #include "hle.h"
 
 uint64_t renderer_present_count(void);
+uint64_t renderer_game_frame(void);
 
 typedef struct {
     uint64_t pc;
     uint64_t frames, last_frame;  // presents it stored in
     uint64_t hits, inc1, dec1, same;
     int64_t last_delta;
+    float fdelta; uint64_t fsame;  // (size 4 as float: the same non-zero float step as the previous store)
     uint64_t addr, old, nw;
     int size;
 } Site;
@@ -54,15 +56,23 @@ static void report(void) {
     static Site out[SITES];
     int n = 0;
     long window = g_to - g_from + 1;
-    for (unsigned i = 0; i < SITES; i++)
-        if (g_sites[i].pc && g_sites[i].frames * 10 >= (uint64_t)window * 8) out[n++] = g_sites[i];  // (>= 80% of the presents)
+    // LARECOMP_TRACE_MIN_PCT=<n>: report sites storing in >= n% of the presents (default 80); with a low n, only
+    // sites that step by +1 or a steady step most of the time (a counter running for part of the window)
+    int pct = getenv("LARECOMP_TRACE_MIN_PCT") ? atoi(getenv("LARECOMP_TRACE_MIN_PCT")) : 80;
+    for (unsigned i = 0; i < SITES; i++) {
+        const Site *s = &g_sites[i];
+        if (!s->pc || s->frames * 100 < (uint64_t)window * (uint64_t)pct) continue;
+        if (pct < 80 && !(s->inc1 * 2 >= s->hits || s->same * 2 >= s->hits)) continue;
+        if (pct < 80 && s->hits > s->frames * 4) continue;
+        out[n++] = *s;
+    }
     qsort(out, (size_t)n, sizeof out[0], cmp_site);
-    LOG("[trace] %d store sites in >= 80%% of the %ld presents\n", n, window);
-    for (int i = 0; i < n && i < 600; i++) {
+    LOG("[trace] %d store sites in >= %d%% of the %ld presents\n", n, pct, window);
+    for (int i = 0; i < n && i < 6000; i++) {
         const Site *s = &out[i];
-        LOG("[trace] pc %llx presents %llu hits %llu +1 %llu -1 %llu same-step %llu size %d addr %llx %llx -> %llx\n", (unsigned long long)s->pc,
+        LOG("[trace] pc %llx presents %llu hits %llu +1 %llu -1 %llu same-step %llu fsame %llu fstep %g size %d addr %llx %llx -> %llx\n", (unsigned long long)s->pc,
             (unsigned long long)s->frames, (unsigned long long)s->hits, (unsigned long long)s->inc1, (unsigned long long)s->dec1,
-            (unsigned long long)s->same, s->size, (unsigned long long)s->addr, (unsigned long long)s->old, (unsigned long long)s->nw);
+            (unsigned long long)s->same, (unsigned long long)s->fsame, (double)s->fdelta, s->size, (unsigned long long)s->addr, (unsigned long long)s->old, (unsigned long long)s->nw);
     }
 }
 
@@ -81,9 +91,14 @@ static void undo_init(void) {
 
 void rt_trace_store(uint64_t pc, uint64_t addr, uint64_t old, uint64_t nw, int size) {
     if (g_nundo < 0) undo_init();
-    if (g_nundo && (renderer_present_count() & 1))
+    static long undo_from = -1;  // LARECOMP_TRACE_UNDO_FROM=<present>: undo only from there on (from boot it breaks init)
+    if (undo_from < 0) undo_from = getenv("LARECOMP_TRACE_UNDO_FROM") ? atol(getenv("LARECOMP_TRACE_UNDO_FROM")) : 0;
+    if (g_nundo && (renderer_present_count() & 1) && (long)renderer_present_count() >= undo_from)
         for (int i = 0; i < g_nundo; i++)
             if (g_undo[i] == pc) {
+                static _Atomic long nund; long k = ++nund;
+                if (k == 1 || k == 1000 || k == 100000) LOG("[trace] undo #%ld pc %llx at present %llu (game frame %llu)\n", k, (unsigned long long)pc,
+                    (unsigned long long)renderer_present_count(), (unsigned long long)renderer_game_frame());
                 if (size == 4) *(uint32_t *)(uintptr_t)addr = (uint32_t)old;
                 else if (size == 1) *(uint8_t *)(uintptr_t)addr = (uint8_t)old;
                 else if (size == 8) *(uint64_t *)(uintptr_t)addr = old;
@@ -119,6 +134,12 @@ void rt_trace_store(uint64_t pc, uint64_t addr, uint64_t old, uint64_t nw, int s
     if (d == -1) s->dec1++;
     if (d == s->last_delta) s->same++;
     s->last_delta = d;
+    if (size == 4) {
+        float fo, fn; uint32_t uo = (uint32_t)old, un = (uint32_t)nw; memcpy(&fo, &uo, 4); memcpy(&fn, &un, 4);
+        float fd = fn - fo;
+        if (fd == fd && fd != 0.0f && fd > -1e6f && fd < 1e6f && fd == s->fdelta) s->fsame++;
+        s->fdelta = fd;
+    }
     s->addr = addr, s->old = old, s->nw = nw, s->size = size;
     atomic_flag_clear(&g_lock);
 }

@@ -1,5 +1,6 @@
 #include "settings.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,8 @@ static const char *settings_file(void) {
 
 Settings g_settings = {
     .fullscreen = false,
+    .window_mode = -1,  // (-1: no window_mode line in the file - from its fullscreen line then, else windowed)
+    .win_w = 1280, .win_h = 720, .win_x = INT_MIN, .win_y = INT_MIN,
     .fps = 30,
     .volume = 1.0f,
     .brightness = 1.0f,
@@ -29,6 +32,7 @@ Settings g_settings = {
     .ssao_temporal = true,
     .ssao_samples = 16,
     .shadow_filter = SHADOW_SMOOTH,
+    .outlines = OUTLINE_SMOOTH,
     .ui2x = true,
     .blur_quality = true,
     .mv_objects = true,
@@ -72,6 +76,15 @@ static void parse_line(const char *line) {
         return;
     }
     if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
+    else if (!strcmp(key, "window_mode")) g_settings.window_mode = !strcmp(val, "borderless") ? WINDOW_BORDERLESS
+                                                                  : !strcmp(val, "fullscreen") ? WINDOW_FULLSCREEN : WINDOW_WINDOWED;
+    else if (!strcmp(key, "window_size")) {
+        int w, h;
+        if (sscanf(val, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 180 && w <= 16384 && h <= 16384) g_settings.win_w = w, g_settings.win_h = h;
+    } else if (!strcmp(key, "window_pos")) {
+        int x, y;
+        if (sscanf(val, "%d,%d", &x, &y) == 2) g_settings.win_x = x, g_settings.win_y = y;
+    } else if (!strcmp(key, "window_maximized")) g_settings.win_max = atoi(val) != 0;
     else if (!strcmp(key, "fps")) g_settings.fps = atoi(val) == 120 ? 120 : atoi(val) == 60 ? 60 : 30;
     else if (!strcmp(key, "render_height")) g_settings.res_height = atoi(val) >= 360 && atoi(val) <= 4320 ? atoi(val) : 0;
     else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
@@ -87,6 +100,8 @@ static void parse_line(const char *line) {
     else if (!strcmp(key, "gi_debug")) g_settings.gi_debug = atoi(val) != 0;  // (by hand / tests: never saved)
     else if (!strcmp(key, "ui2x")) g_settings.ui2x = atoi(val) != 0;
     else if (!strcmp(key, "blur_quality")) g_settings.blur_quality = atoi(val) != 0;
+    else if (!strcmp(key, "outlines"))
+        g_settings.outlines = !strcmp(val, "off") ? OUTLINE_OFF : !strcmp(val, "on") ? OUTLINE_ON : OUTLINE_SMOOTH;
     else if (!strcmp(key, "shadow_filter"))
         g_settings.shadow_filter = !strcmp(val, "game") ? SHADOW_GAME : !strcmp(val, "bilinear") ? SHADOW_BILINEAR : SHADOW_SMOOTH;
     else if (!strcmp(key, "ssao_debug")) g_settings.ssao_debug = atoi(val) != 0;  // (by hand / tests: never saved)
@@ -195,7 +210,7 @@ void settings_load(void) {
     if (loaded) return;
     loaded = true;
     FILE *f = fopen(SETTINGS_FILE, "r");
-    if (!f) { settings_apply_levels(); return; }
+    if (!f) { g_settings.window_mode = WINDOW_WINDOWED; settings_apply_levels(); return; }
     char line[1200];  // (the mods list can be long)
     while (fgets(line, sizeof line, f)) {
         // (a file edited by hand may have CRLF: "resolution = dynamic\r" did not match and fell back silently)
@@ -214,6 +229,9 @@ void settings_load(void) {
         }
     }
     fclose(f);
+    // (a file from before the window modes: its fullscreen line - borderless, what SDL's full screen was)
+    if (g_settings.window_mode < 0) g_settings.window_mode = g_settings.fullscreen ? WINDOW_BORDERLESS : WINDOW_WINDOWED;
+    g_settings.fullscreen = g_settings.window_mode != WINDOW_WINDOWED;
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
     settings_clamp_color();
@@ -224,7 +242,12 @@ void settings_save(void) {
     FILE *f = fopen(SETTINGS_FILE, "w");
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# " RT_APP_NAME " settings (set on the start screen)\n");
-    fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
+    fprintf(f, "fullscreen = %d\n", g_settings.window_mode > WINDOW_WINDOWED);
+    fprintf(f, "window_mode = %s\n", g_settings.window_mode == WINDOW_BORDERLESS ? "borderless"
+                                   : g_settings.window_mode == WINDOW_FULLSCREEN ? "fullscreen" : "windowed");
+    fprintf(f, "window_size = %dx%d\n", g_settings.win_w, g_settings.win_h);
+    if (g_settings.win_x != INT_MIN) fprintf(f, "window_pos = %d,%d\n", g_settings.win_x, g_settings.win_y);
+    fprintf(f, "window_maximized = %d\n", g_settings.win_max);
     fprintf(f, "fps = %d\n", g_settings.fps);
     fprintf(f, "render_height = %d\n", g_settings.res_height);
     fprintf(f, "smaa = %d\n", g_settings.antialias != AA_OFF);
@@ -251,6 +274,7 @@ void settings_save(void) {
     fprintf(f, "mv_objects = %d\n", g_settings.mv_objects);
     fprintf(f, "ui2x = %d\n", g_settings.ui2x);
     fprintf(f, "blur_quality = %d\n", g_settings.blur_quality);
+    fprintf(f, "outlines = %s\n", g_settings.outlines == OUTLINE_OFF ? "off" : g_settings.outlines == OUTLINE_ON ? "on" : "smooth");
     fprintf(f, "shadow_filter = %s\n", g_settings.shadow_filter == SHADOW_GAME ? "game" :
                                        g_settings.shadow_filter == SHADOW_BILINEAR ? "bilinear" : "smooth");
     fprintf(f, "reverb = %d\n", g_settings.reverb);

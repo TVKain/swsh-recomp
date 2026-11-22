@@ -124,6 +124,29 @@ void rt_call_original(Cpu *c, uint64_t addr) {
     LOG("[fnhook] no game function at %llx\n", (unsigned long long)addr);
 }
 
+// ---- LARECOMP_FNSKIP="<addr>[,<addr>...]" (research, with LARECOMP_FNSKIP_FROM=<game frame>): those guest functions
+// return at once on odd game frames from there on - a subsystem updating every other frame. Bisects which update a
+// frame-counted clock lives in (60 fps cutscenes, docs in C:\Games\pokemon-sword\CLAUDE.md).
+static long g_skip_from;
+static int skip_hook(Cpu *c, uint64_t addr) {
+    extern uint64_t renderer_game_frame(void);
+    uint64_t f = renderer_game_frame();
+    (void)c;
+    static _Atomic int logged, calls;
+    if (atomic_fetch_add(&calls, 1) == 0) LOG("[fnskip] first entry of %llx at frame %llu\n", (unsigned long long)addr, (unsigned long long)f);
+    int skip = (long)f >= g_skip_from && (f & 1);
+    if (skip && atomic_fetch_add(&logged, 1) < 3) LOG("[fnskip] skipped %llx at frame %llu\n", (unsigned long long)addr, (unsigned long long)f);
+    return skip;
+}
+__attribute__((constructor)) static void skip_init(void) {
+    const char *e = getenv("LARECOMP_FNSKIP");
+    if (!e) return;
+    g_skip_from = getenv("LARECOMP_FNSKIP_FROM") ? atol(getenv("LARECOMP_FNSKIP_FROM")) : 0;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", e);
+    for (char *t = strtok(buf, ","); t; t = strtok(NULL, ",")) reg(strtoull(t, NULL, 16), skip_hook, true);
+}
+
 // ---- LARECOMP_HOOK_DUMP
 typedef struct { uint64_t addr; int nargs; struct { int reg, deref; uint32_t len; } arg[8]; _Atomic int hits; } Dump;
 static Dump dumps[32];

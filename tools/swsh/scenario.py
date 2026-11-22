@@ -1,7 +1,7 @@
 """scenario.py: runs one Sword 1.3.2 test scenario and records the evidence (docs/engineering/README.md).
 
   python tools/swsh/scenario.py <scenario> [--profile 1440p30|1440p60|1080p30|...] [--cache warm|cold]
-                               [--runs N] [--validation [sync|gpuav]] [--label L] [--exe build/v132/lasrecomp.exe]
+                               [--runs N] [--validation [sync|gpuav]] [--label L] [--exe build/v132/PokemonSword.exe]
 
 A scenario is tests/scenarios/<name>.json:
   {"save": "build/scenario-saves/stairs", "input": "600:A:8,...", "exit_at": 3000, "measure": [2800, 3000],
@@ -57,7 +57,7 @@ def sword_instances():
     """Process ids of running Sword 1.3.2 runtimes (command line with extracted-132), ours or the player's. One that has
     exited but is still being torn down is left out (a validation-layer run left 2 million handles for Windows to close:
     it stayed listed for hours, its last thread in the driver)."""
-    ps = ("Get-CimInstance Win32_Process -Filter \"Name='lasrecomp.exe'\" | "
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='PokemonSword.exe'\" | "
           "Where-Object { $_.CommandLine -like '*extracted-132*' } | "
           "Where-Object { $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; $p -and -not $p.HasExited } | "
           "ForEach-Object { $_.ProcessId }")
@@ -66,9 +66,9 @@ def sword_instances():
 
 
 def other_runtimes():
-    """Running lasrecomp.exe that are not a Sword 1.3.2 run of ours (another project's tests share the GPU and the CPU).
+    """Running PokemonSword.exe that are not a Sword 1.3.2 run of ours (another project's tests share the GPU and the CPU).
     Only active ones count: a working set over 500 MB (a stopped leftover sits at ~40 MB, a running game uses GBs)."""
-    ps = ("Get-CimInstance Win32_Process -Filter \"Name='lasrecomp.exe'\" | "
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='PokemonSword.exe'\" | "
           "Where-Object { $_.CommandLine -notlike '*extracted-132*' -and $_.WorkingSetSize -gt 500MB } | "
           "ForEach-Object { $_.ProcessId }")
     out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True).stdout
@@ -169,7 +169,7 @@ def run_once(name, sc, args, run_dir):
             o = other_runtimes()
             if o:
                 seen_others.extend(o)
-            ps = ("Get-CimInstance Win32_Process -Filter \"Name='lasrecomp.exe'\" | Where-Object { $_.CommandLine -like "
+            ps = ("Get-CimInstance Win32_Process -Filter \"Name='PokemonSword.exe'\" | Where-Object { $_.CommandLine -like "
                   "'*extracted-132*' } | Measure-Object -Property WorkingSetSize -Maximum | ForEach-Object { $_.Maximum }")
             out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True).stdout.strip()
             if out.replace(".", "").isdigit():
@@ -245,7 +245,7 @@ def main():
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--validation", nargs="?", const="basic", default="")
     ap.add_argument("--label", default="")
-    ap.add_argument("--exe", default=os.path.join("build", "v132", "lasrecomp.exe"))
+    ap.add_argument("--exe", default=os.path.join("build", "PokemonSword.exe"))
     ap.add_argument("--env", action="append", help="VAR=value for this run (repeatable)")
     ap.add_argument("--ini", action="append", help="key=value added to the run's larecomp.ini, over the profile's (repeatable)")
     args = ap.parse_args()

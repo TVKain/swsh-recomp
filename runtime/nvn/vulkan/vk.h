@@ -38,7 +38,7 @@ typedef struct {
     _Atomic int parts_dirty;       // a part was built since vk_parts.bin was written
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
-    bool custom_border, divisor, host_import, depth_clamp;
+    bool custom_border, divisor, host_import, depth_clamp, depth_bias_clamp;
     bool gpl;  // VK_EXT_graphics_pipeline_library with fast linking (exec.c: pipelines linked from per-program parts)
     // window
     VkSurfaceKHR surface;

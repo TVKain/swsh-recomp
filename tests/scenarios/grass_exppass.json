@@ -1,0 +1,20 @@
+{
+ "description": "Player's grass save: X menu -> navigate to the Expansion Pass tile -> A (player report: freezes)",
+ "save": "build/scenario-saves/user_grass",
+ "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8,1700:X:4,1760:DOWN:4,1780:RIGHT:4,1800:RIGHT:4,1820:RIGHT:4,1840:RIGHT:4,1860:DOWN:4,1880:A:4,2100:A:4,2250:A:4,2400:A:4",
+ "exit_at": 2700,
+ "measure": [
+  1650,
+  2200
+ ],
+ "shots": [
+  2050,
+  2150,
+  2200,
+  2300,
+  2350,
+  2450,
+  2550,
+  2650
+ ]
+}

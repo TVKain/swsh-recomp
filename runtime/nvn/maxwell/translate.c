@@ -25,6 +25,7 @@
 
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
 const uint8_t *maxwell_dbg_code;
+static __thread uint64_t t_fs_hash;  // the fragment shader being translated (exec.c's hash): per-shader fixes
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
 const uint8_t *maxwell_dbg_vs;
@@ -1818,6 +1819,7 @@ static const char glsl_prelude[] =
     "#extension GL_KHR_shader_subgroup_shuffle : require\n"
     "#extension GL_KHR_shader_subgroup_shuffle_relative : require\n"
     "#extension GL_KHR_shader_subgroup_quad : require\n"
+    "#extension GL_KHR_shader_subgroup_arithmetic : require\n"
     "#extension GL_EXT_texture_shadow_lod : require\n"
     "#define cbr(cb, off) cb[min((off) >> 4, uint(cb.length() - 1))][((off) >> 2) & 3u]\n"
     "uint as_u(float x) { return floatBitsToUint(x); }\n"
@@ -2032,9 +2034,23 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (any_branch) {
         sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
         sp(&s, "  bool exit_now = false;\n");
-        sp(&s, "  for (uint guard = 0u; guard < 100000u; guard++) {\n  switch (pc) {\n");
+        // Fragment shaders: each turn of the dispatch loop runs only the invocations at the lowest pending pc of the
+        // subgroup; the others wait for them. Paths of different lengths to the same instruction (a case that ends in
+        // `continue`, another that falls through) otherwise reach it on different turns of the loop, so a 2x2 quad
+        // runs it split. Code after that point that needs the quad together then reads inactive neighbours: implicit
+        // texture LOD (a wrong mip on every fourth row of a character drawn after the game's 4x4 dither switch: the
+        // striped bodies on Intel Arc), derivatives and quad swaps. The GPU itself reconverges warps in program order,
+        // which this is. LARECOMP_NO_PC_SYNC=1: every invocation runs its own case each turn, as before (A/B).
+        static int pc_sync = -1;
+        if (pc_sync < 0) pc_sync = getenv("LARECOMP_NO_PC_SYNC") == NULL;
+        bool sync = pc_sync && stage == STAGE_FRAGMENT;
+        sp(&s, "  for (uint guard = 0u; guard < 100000u; guard++) {\n");
+        if (sync) sp(&s, "  if (pc == subgroupMin(pc)) {\n");
+        sp(&s, "  switch (pc) {\n");
         sp(&s, "%s", body.buf ? body.buf : "");
-        sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n  if (exit_now) break;\n  }\n");
+        sp(&s, "    exit_now = true; break;\n  default: exit_now = true; break;\n  }\n");
+        if (sync) sp(&s, "  }\n");
+        sp(&s, "  if (exit_now) break;\n  }\n");
     } else {
         sp(&s, "  do {\n%s  } while (false);\n", body.buf ? body.buf : "");
     }
@@ -2063,6 +2079,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                 r++;
             }
         }
+        if (tint && t_fs_hash == 0x80fadac0bdd17c40ull)  // Sword's depth of field prep (exec.c dof_linear): alpha = depth
+            sp(&s, "  if (ltint[1].z > 0.0f) { float dz = (c0[3] - as_f(cb3[46][0])) / as_f(cb3[14][0]); float zn = 2.0f * dz - 1.0f;\n"
+                   "    float nn = ltint[1].x, ff = ltint[1].y; c0[3] = (2.0f * nn * ff / ((ff + nn) - zn * (ff - nn))) * ltint[1].z; }\n");
         if (tint)
             sp(&s, "  if (ltint[0].w > 0.0f) { vec3 g = c0.rgb; float l = dot(g, vec3(0.299f, 0.587f, 0.114f));\n"
                    "    c0.rgb = mix(g, ltint[0].rgb * pow(l, ltint[1].w) + ltint[1].rgb * l, ltint[0].w); }\n");
@@ -2081,6 +2100,12 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
 }
 
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
+    t_fs_hash = 0;
+    if (stage == STAGE_FRAGMENT) {  // (the same hash as exec.c's fragment-shader hash)
+        uint64_t h = 1469598103934665603ull;
+        for (int i = 0; i < 0x200; i++) { h ^= blob[0x30 + i]; h *= 0x100000001B3ull; }
+        t_fs_hash = h;
+    }
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
     Ctx *c = calloc(1, sizeof *c);

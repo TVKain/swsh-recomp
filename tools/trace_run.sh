@@ -14,7 +14,7 @@ IN="400:A:6,500:A:6,1150:A:6,1300:A:6,1400:STICK_LEFT:300,1700:STICK_DOWN:120,18
     export LARECOMP_INPUT="$IN" LARECOMP_NO_USER_INPUT=1 LARECOMP_SAVE_DIR=build/test-save LARECOMP_NO_AUDIO=1 \
         LARECOMP_SHOT_AT="$last" LARECOMP_GAME_LIB="$(cygpath -w "$PWD/build/trace/lasgame.dll")"
     for kv in "$@"; do export "$kv"; done
-    exec ./build/trace/lasrecomp.exe extracted --play > "logs/repro-$name.log" 2>&1
+    exec ./build/trace/PokemonSword.exe extracted --play > "logs/repro-$name.log" 2>&1
 ) &
 pid=$!
 for _ in $(seq 1 900); do [ -f "$(printf 'build/frames/frame_%05d.png' "$last")" ] && break; sleep 1; done

@@ -22,7 +22,7 @@ void ui_style(void);
 struct UiScaler { ImGuiStyle base; float scale = -1; };
 float ui_scale(UiScaler &s, float window_h);
 
-extern const ImVec4 UI_GOLD, UI_GREEN_TEXT, UI_RED_TEXT, UI_TEXT, UI_HEADING;
+extern const ImVec4 UI_GOLD, UI_GREEN_TEXT, UI_RED_TEXT, UI_TEXT, UI_HEADING, UI_MUTED, UI_ACCENT;
 // The lime background with gears, stripes and dots (animated), in a rounded rect / behind the current window (right
 // after its Begin, with ImGuiCol_WindowBg transparent)
 void ui_backdrop(ImDrawList *dl, ImVec2 a, ImVec2 b, float rounding);
@@ -57,6 +57,7 @@ bool ui_value_button(const char *id, const char *text, ImU32 col);
 // A button as a pill on the grid: its left end on the rows' left end, its text on the text column (width 0: the
 // text's, -1: the whole row)
 bool ui_button(const char *label, float width = 0);
+bool ui_button_primary(const char *label, float width = 0);  // accent-filled: the page's main action
 // A row's pill on the current line with no label (the caller lays out its own items on it); true when it has the cursor
 bool ui_pill_row(void);
 // Whether a pill drawn by the caller has the cursor (the arrow then points at it)
@@ -75,4 +76,8 @@ void ui_tabs_begin(int *current, int count);
 float ui_graphics_x(const char *const *extra, int n_extra);
 void ui_page_graphics(float x, bool known);
 void ui_page_image_sound(void);
+void ui_layout_combo(float x);  // the controller layout row (Automatic / Nintendo / Xbox / Western)
+// The window mode row (settings.h WINDOW_*): its label (for ui_graphics_x's extra labels), the row; true when changed
+const char *ui_window_mode_label(void);
+bool ui_window_mode_row(float x, int *mode);
 void ui_page_advanced(void);

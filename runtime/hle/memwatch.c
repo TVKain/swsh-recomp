@@ -69,6 +69,8 @@ static void watch(uint64_t addr) {
     LOG("[watch] watching %llx (now %08x)\n", (unsigned long long)addr, *(volatile uint32_t *)(uintptr_t)addr);
 }
 
+void memwatch_add(uint64_t addr) { watch(addr); }  // (runtime/nvn/vulkan/exec.c LARECOMP_WATCH_DRAW)
+
 // LARECOMP_WATCH_SPECIES="133:10,16:9,...": only records with one of these species:level pairs (the party you know)
 static bool known_pair(uint16_t sp, uint8_t lv) {
     const char *e = getenv("LARECOMP_WATCH_SPECIES");

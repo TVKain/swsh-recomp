@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define RT_BUNDLE_ID "com.peiikai.lasrecomp"  // (data folder on macOS / Linux: kept)
-#define RT_APP_NAME "SwSh Recomp"             // window title, messages, the launcher
+#define RT_APP_NAME "Pokémon Sword"             // window title, messages, the launcher
 #define RT_APP_VERSION "0.3.1"                // the release (Makefile `dist` names the zip after it)
 
 void rt_paths_init(void);         // first thing in main(), after plat_init

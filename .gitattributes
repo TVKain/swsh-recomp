@@ -4,7 +4,6 @@
 *.ps1 text eol=crlf
 *.png binary
 *.ico binary
-*.icns binary
 *.ttf binary
 *.otf binary
 *.jpg binary

@@ -41,7 +41,10 @@ static uint64_t stat_upload_bytes;
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
 static int prof = -1;
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
-static VkQueryPool prof_qp;
+static VkQueryPool prof_qp;  // (submission timestamps: LARECOMP_VK_PROF, or dynamic resolution's GPU time)
+static uint64_t g_gpu_ns_total;  // GPU time of every finished submission so far (ns; read with vk_gpu_ns_total)
+uint64_t vk_gpu_ns_total(void) { return g_gpu_ns_total; }
+bool vk_gpu_timing(void) { return prof_qp != VK_NULL_HANDLE; }
 static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
 static uint32_t prof_end_line[4096];  // passes ended, by the exec.c line that ended them (0: submit / present)
 uint64_t prof_views_created;  // textures.c vk_image_view cache misses
@@ -71,6 +74,7 @@ static int SUBS = 128;
 typedef struct {
     VkCommandBuffer main, upload;
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
+    bool ts_wait;  // it waited on a semaphore (the swapchain image): its span includes that wait, not counted as busy
     uint64_t seq;
     VkDescriptorPool pools[16];
     int npools, cur_pool;
@@ -176,10 +180,20 @@ static Sub *sub(void) {
     Sub *s = &subs[cur_sub];
     if (s->seq != submit_seq + 1) {  // slot reused: its previous submission must be done
         vk_wait_seq(s->seq);
-        if (s->ts) {  // (profiling) GPU time of that submission
+        if (s->ts) {  // (profiling / dynamic resolution) GPU time of that submission
             uint64_t t[2];
-            if (vkGetQueryPoolResults(g_vk.dev, prof_qp, (uint32_t)cur_sub * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
-                prof_gpu += (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod);
+            if (vkGetQueryPoolResults(g_vk.dev, prof_qp, (uint32_t)cur_sub * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) {
+                double per = g_vk.props.limits.timestampPeriod;
+                prof_gpu += (uint64_t)((double)(t[1] - t[0]) * per);
+                // (busy time = the union of the submissions' intervals: they overlap on the GPU, a plain sum counts
+                // the overlap twice. Slots are retired in submission order, so the intervals come sorted by start.)
+                static uint64_t last_end;
+                uint64_t from = t[0] > last_end ? t[0] : last_end;
+                if (!s->ts_wait) {
+                    if (t[1] > from) g_gpu_ns_total += (uint64_t)((double)(t[1] - from) * per);
+                    if (t[1] > last_end) last_end = t[1];
+                }
+            }
             s->ts = false;
         }
         for (int i = 0; i < s->npools; i++) vkResetDescriptorPool(g_vk.dev, s->pools[i], 0);
@@ -212,7 +226,7 @@ VkCommandBuffer vk_cmd(void) {
     if (!s->main_begun) {
         begin_cb(&s->main, &s->main_begun);
         gp_mark(s->main, "(submission start; includes GPU idle before it)");
-        if (prof && prof_qp) {
+        if (prof_qp) {
             vkCmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 2, 2);
             vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 2);
             s->ts = true;
@@ -346,6 +360,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->upload};
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
+    s->ts_wait = wait != VK_NULL_HANDLE;
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
@@ -1376,7 +1391,9 @@ void vk_exec_init(void) {
     }
     LOG("[vk] submission ring: %d\n", SUBS);
     prof = getenv("LARECOMP_VK_PROF") != NULL;
-    if (prof) {
+    // (dynamic resolution needs the GPU's time per frame: 2 timestamps per submission. LARECOMP_NO_GPU_TIMING=1: off,
+    // dynamic resolution then goes by the frame time alone and never above the display's size)
+    if (prof || !getenv("LARECOMP_NO_GPU_TIMING")) {  // (always: the mode can change in the F12 menu)
         prof_up_ns = 0;
         VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = SUBS_MAX * 2};
         if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &prof_qp) != VK_SUCCESS) prof_qp = VK_NULL_HANDLE;
@@ -1437,6 +1454,12 @@ static struct {
     int hist_mode;
 } taa;
 static bool taa_wanted(void) { return g_settings.antialias == AA_TAA || g_settings.antialias == AA_DLAA; }
+// Depth of field input (CLAUDE.md "Rose close-up"): Sword's DOF chain compares its input with layer distances in
+// metres / 360 (f_70004a7e70), but its prep shader (this hash) passes the raw depth buffer through (alpha = depth *
+// (f-n)/f): near subjects came out blurred (Rose's close-up in the opening). The prep's alpha is made linear distance
+// / 360 m (translate.c, from the scene's near / far). LARECOMP_DOF_RAW=1: the old behaviour.
+#define DOF_PREP_FS 0x80fadac0bdd17c40ull
+static bool dof_linear(void) { static int on = -1; if (on < 0) on = getenv("LARECOMP_DOF_RAW") == NULL; return on; }
 static float halton(uint32_t i, uint32_t b) {
     float f = 1, r = 0;
     for (; i; i /= b) f /= (float)b, r += f * (float)(i % b);
@@ -1610,7 +1633,7 @@ static void begin_pass(void) {
     stat_passes++;
     ao.qual = ao.pending = false;
     taa.pending = taa.jit_pass = false;
-    if ((g_settings.ssao || taa_wanted()) && !ao.busy) {
+    if ((g_settings.ssao || taa_wanted() || dof_linear()) && !ao.busy) {
         uint64_t fr = vk_frame_counter();
         if (ao.frame != fr) { ao.frame = fr; ao.opaque = 0; ao.dtex = ao.ctex = NULL; }
         TexBackend *c0 = pass_ncolor && ca[0].imageView && st.rt.color[0] ? st.rt.color[0]->backend : NULL;
@@ -3067,6 +3090,20 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
 }
 
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
+// Sword's stadium crowd fragment programs (fragment-shader hashes of the draw dumps), by code address: the cbuf slot
+// holding the crowd's flipbook block, -1 for any other program. da55927dce80b534 = the colour pass (slot 1),
+// 3662a49cc929fe5a = the depth pre-pass that cuts the silhouettes (slot 0; the colour pass then draws on equal depth).
+static int crowd_fs_slot(uint64_t fs) {
+    static uint64_t last;
+    static int slot = -1;
+    if (fs != last) {
+        last = fs;
+        uint64_t h = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+        slot = h == 0xda55927dce80b534ull ? 1 : h == 0x3662a49cc929fe5aull ? 0 : -1;
+    }
+    return slot;
+}
+
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
     if (k == 0) {
@@ -3135,6 +3172,28 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     if (ip_enabled()) {  // frame interpolation: recorded, or the blended copy in the replay
         const void *d = ip_cbuf(stage, k, r.addr, (uint32_t)size);
         if (d) return ubo_span(vk_transient_copy(d, size, 256), size);
+    }
+    // Sword's stadium crowd at 60 fps (runtime/hle/swsh60.c): the crowd's fragment shader takes its flipbook position in
+    // a fragment cbuf block, word 4, in 1/32 steps (crowd_fs_slot). The game evaluates that stepped curve (a pose every 2
+    // frames, 15 a second: only even 32nds at 30 fps) with linear interpolation at the measured time; at 60 fps the half
+    // frames between two poses give the odd 32nds - another cell of the atlas, shown one frame in four: the crowd
+    // "ghosting / glitching too fast" seen from afar. Snapped to the pose grid (1/16): each pose 4 frames at 60, as at 30.
+    // LARECOMP_SWSH60_NO_CROWD=1: off.
+    if (stage == 1 && size >= 20 && st.program && idx >= 0 && crowd_fs_slot(st.program->stages[1].code_addr) == idx) {
+        extern bool swsh60_enabled(void);
+        static int off = -1;
+        if (off < 0) off = getenv("LARECOMP_SWSH60_NO_CROWD") != NULL;
+        if (!off && swsh60_enabled() && size <= 256) {
+            uint8_t tmp[256];
+            memcpy(tmp, (const void *)(uintptr_t)r.addr, size);
+            float t, t0;
+            memcpy(&t0, tmp + 16, 4);
+            t = floorf(t0 * 16.0f + 1e-4f) / 16.0f;
+            memcpy(tmp + 16, &t, 4);
+            static int logged;
+            if (logged < 8 && t != t0) { logged++; LOG("[swsh60] crowd flipbook %g -> %g (present %llu)\n", t0, t, (unsigned long long)renderer_present_count()); }
+            return ubo_span(vk_transient_copy(tmp, size, 256), size);
+        }
     }
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
@@ -3671,16 +3730,56 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
 }
 
 static void draw_(CmdRec *r, bool indexed);
+static Prog *g_dump_prog;  // (the last draw's program: LARECOMP_DEBUG_PASS_DRAWS writes its GLSL next to the image)
+// Sword's outline pass: a full-screen edge detect over the object-ID buffer at the game's render size (1536x864 in
+// the 1920x1080 targets), each pixel fully outlined or not; the game then scales the scene up -> stair-stepped
+// outlines no later SMAA can fix (player report). Settings "outlines" (F12 menu): off skips it, smooth runs SMAA on
+// the scene right after it (outline_smooth), before the scale-up. Found 2026-11-22 (starter scene, pass 120 draw 093).
+#define OUTLINE_FS 0x288506cae9583983ull
+static void outline_pre(TexBackend *tb, VkRect2D r);
+static void outline_smooth(TexBackend *tb, VkRect2D r);
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
+    // (the outline program's code address, seen once by its hash: the copy has to be made BEFORE its draw, when the
+    // hash of this draw's program is not known yet)
+    static uint64_t outline_code;
+    bool target = st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend;
+    bool soft = g_settings.outlines == OUTLINE_SMOOTH && outline_code && target && st.program &&
+                st.program->stages[1].code_addr == outline_code;
+    VkRect2D orect = {{0, 0}, {0, 0}};
+    if (soft) {  // (the part of the target the game draws: its viewport, scaled, plus a pixel for the 3x3 kernel)
+        TexBackend *tb = st.rt.color[0]->backend;
+        float tsx, tsy;
+        renderer_texture_scale(st.rt.color[0], &tsx, &tsy);
+        int x0 = (int)floorf(st.viewport[0][0] * tsx) - 1, y0 = (int)floorf(st.viewport[0][1] * tsy) - 1;
+        int x1 = (int)ceilf((st.viewport[0][0] + st.viewport[0][2]) * tsx) + 1, y1 = (int)ceilf((st.viewport[0][1] + st.viewport[0][3]) * tsy) + 1;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > (int)tb->width || x1 <= x0) x1 = (int)tb->width;
+        if (y1 > (int)tb->height || y1 <= y0) y1 = (int)tb->height;
+        orect = (VkRect2D){{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+        if (in_pass) { vkCmdEndRendering(vk_cmd()); in_pass = false; }
+        outline_pre(tb, orect);
+        st.rt_dirty = true;  // (begun again by the draw, loading what is there)
+    }
     draw_(r, indexed);
     PROF_ADD(prof_draw);
+    if (g_cur_fs_hash == OUTLINE_FS && st.program) outline_code = st.program->stages[1].code_addr;
+    if (soft && g_cur_fs_hash == OUTLINE_FS && target) {
+        if (in_pass) { vkCmdEndRendering(vk_cmd()); in_pass = false; }
+        outline_smooth(st.rt.color[0]->backend, orect);
+        st.rt_dirty = true;
+    }
     // LARECOMP_DEBUG_PASS_DRAWS=<pass number> (with F9 / LARECOMP_DEBUG_FRAME): in the debug frame, that pass's colour
     // target after each of its draws -> build/draw_<frame>_<n>.png, with the draw's programs logged (which draw paints
     // what: docs/DEPURACAO.md). The pass is ended and begun again (loading what is there) around each save.
-    static int want = -2;
-    if (want == -2) want = getenv("LARECOMP_DEBUG_PASS_DRAWS") ? atoi(getenv("LARECOMP_DEBUG_PASS_DRAWS")) : -1;
-    if (want < 0 || !g_debug_frame || debug_pass_no != want || !in_pass || !st.rt.ncolor || !st.rt.color[0] ||
+    static int want = -2, want_hi = -1;  // (<pass> or <first>-<last>)
+    if (want == -2) {
+        const char *e = getenv("LARECOMP_DEBUG_PASS_DRAWS");
+        want = e ? atoi(e) : -1;
+        want_hi = e && strchr(e, '-') ? atoi(strchr(e, '-') + 1) : want;
+    }
+    if (want < 0 || !g_debug_frame || debug_pass_no < want || debug_pass_no > want_hi || !in_pass || !st.rt.ncolor || !st.rt.color[0] ||
         !st.rt.color[0]->backend)
         return;
     static uint64_t frame = ~0ull;
@@ -3690,9 +3789,58 @@ static void draw(CmdRec *r, bool indexed) {
     in_pass = false;
     char path[256];
     snprintf(path, sizeof path, "build/draw_%llu_%03d.png", (unsigned long long)frame, n);
-    LOG("[drawdump] %s: vs %llx fs %llx (fs hash %016llx)\n", path, st.program ? (unsigned long long)st.program->stages[0].code_addr : 0ull,
+    LOG("[drawdump] %s (pass %d, %ux%u): vs %llx fs %llx (fs hash %016llx)\n", path, debug_pass_no,
+        ((TexBackend *)st.rt.color[0]->backend)->width, ((TexBackend *)st.rt.color[0]->backend)->height, st.program ? (unsigned long long)st.program->stages[0].code_addr : 0ull,
         st.program ? (unsigned long long)st.program->stages[1].code_addr : 0ull, (unsigned long long)g_cur_fs_hash);
     renderer_save_texture_tex(st.rt.color[0]->backend, path);
+    {   // LARECOMP_DEBUG_PIXELS="x,y x,y ...": the raw texels of the target at those pixels (RGBA16F / RGBA32F / 4-byte)
+        static const char *px = (const char *)-1;
+        if (px == (const char *)-1) px = getenv("LARECOMP_DEBUG_PIXELS");
+        TexBackend *tb = st.rt.color[0]->backend;
+        if (px && tb->image) {
+            uint32_t bpb = tb->format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : tb->format == VK_FORMAT_R32G32B32A32_SFLOAT ? 16 : 4;
+            VkSpan out = vk_readback(64 * 16);
+            VkBufferImageCopy cs[64];
+            int nc = 0;
+            for (const char *q = px; *q && nc < 64;) {
+                int x, y, len = 0;
+                if (sscanf(q, "%d,%d%n", &x, &y, &len) != 2) break;
+                q += len; while (*q == ' ') q++;
+                if (x < 0 || y < 0 || (uint32_t)x >= tb->width || (uint32_t)y >= tb->height) continue;
+                cs[nc] = (VkBufferImageCopy){.bufferOffset = out.off + nc * 16, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                             .imageOffset = {x, y, 0}, .imageExtent = {1, 1, 1}};
+                nc++;
+            }
+            VkCommandBuffer cb = vk_cmd();
+            vk_full_barrier(cb);
+            if (nc) vkCmdCopyImageToBuffer(cb, tb->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, (uint32_t)nc, cs);
+            renderer_flush();
+            for (int i = 0; i < nc; i++) {
+                const uint8_t *d = (const uint8_t *)out.ptr + i * 16;
+                float v[4] = {0};
+                if (bpb == 8) for (int k = 0; k < 4; k++) { uint16_t h; memcpy(&h, d + 2 * k, 2);
+                    uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023; float f = e == 0 ? ldexpf((float)m, -24) : e == 31 ? INFINITY : ldexpf((float)(m | 1024), (int)e - 25);
+                    v[k] = s ? -f : f; }
+                else if (bpb == 16) memcpy(v, d, 16);
+                else for (int k = 0; k < 4; k++) v[k] = d[k] / 255.0f;
+                LOG("[pixel] %s (%d,%d): %.6g %.6g %.6g %.6g\n", path, cs[i].imageOffset.x, cs[i].imageOffset.y, v[0], v[1], v[2], v[3]);
+            }
+        }
+    }
+    if (g_dump_prog && g_dump_prog->fi && g_dump_prog->fi->msl) {
+        char gp[300];
+        snprintf(gp, sizeof gp, "build/draw_%llu_%03d_fs.glsl", (unsigned long long)frame, n);
+        FILE *f = fopen(gp, "w");
+        if (f) { fputs(g_dump_prog->fi->msl, f); fclose(f); }
+        snprintf(gp, sizeof gp, "build/draw_%llu_%03d_vs.glsl", (unsigned long long)frame, n);
+        if (g_dump_prog->vi && g_dump_prog->vi->msl && (f = fopen(gp, "w"))) { fputs(g_dump_prog->vi->msl, f); fclose(f); }
+    }
+    if (st.program && st.program->stages[1].const_offset) {  // the fragment stage's compiler constants (cb1: BRX tables)
+        char gp[300];
+        snprintf(gp, sizeof gp, "build/draw_%llu_%03d_fs_cb1.bin", (unsigned long long)frame, n);
+        FILE *f = fopen(gp, "wb");
+        if (f) { fwrite((void *)(uintptr_t)(st.program->stages[1].code_addr + st.program->stages[1].const_offset), 1, 256, f); fclose(f); }
+    }
     n++;
     st.rt_dirty = true;  // (begin_pass again before the next draw; the target is loaded, not cleared)
 }
@@ -4390,6 +4538,11 @@ static void ssao_find_projection(void) {
         const uint8_t *blk = (const uint8_t *)(uintptr_t)u.addr;
         if (blk && ao.poff + 64 <= u.size && ssao_proj_at((const float *)(blk + ao.poff), proj) &&
             !ssao_cam_at_origin((const float *)(blk + ao.poff), ao.poff)) {
+            static int logp = -1;  // LARECOMP_LOG_PROJ=1: the scene's near / far whenever they change (research)
+            if (logp < 0) logp = getenv("LARECOMP_LOG_PROJ") != NULL;
+            if (logp && (fabsf(proj[2] - ao.proj[2]) > 1e-6f || fabsf(proj[3] - ao.proj[3]) > 1e-6f || fabsf(proj[1] - ao.proj[1]) > 1e-4f))
+                LOG("[proj] present %llu: near %.5g far %.5g P11 %.4f\n", (unsigned long long)renderer_present_count(), proj[3] / (proj[2] - 1),
+                    proj[3] / (proj[2] + 1), proj[1]);
             memcpy(ao.proj, proj, sizeof ao.proj);
             ao.proj_frame = fr;
             taa_capture_camera((const float *)(blk + ao.poff), ao.poff, u.size);
@@ -4887,6 +5040,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (pr && atomic_load(&pr->state) == 0) pf_rest_of_list();  // (about to wait: find the rest of the list's needs first)
     if (pr) wait_built(&pr->state, translate_program, pr);
     if (!pr || atomic_load(&pr->state) != 1) { SKIP(pr ? 1 + (atomic_load(&pr->state) > 1) : 3); return; }
+    g_dump_prog = pr;
     if (draw_texint_keys(pr, &vkey, &fkey)) {
         pr = get_program(st.program, &vkey, &fkey);
         if (pr && atomic_load(&pr->state) == 0) pf_rest_of_list();
@@ -4910,6 +5064,7 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { stat_skipped++; return; }
+        if (last_hash == OUTLINE_FS && g_settings.outlines == OUTLINE_OFF) { g_cur_fs_hash = last_hash; return; }  // (outlines off)
         if (g_debug_frame && getenv("LARECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
     }
@@ -4927,6 +5082,25 @@ static void draw_(CmdRec *r, bool indexed) {
                 NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
                 if (t && (int)t->width == tw && (int)t->height == th) { nd++; ni += (unsigned)(indexed ? r->x[6] : r->x[4]); break; }
             }
+        }
+    }
+    {   // LARECOMP_WATCH_DRAW=<present>:<vertex count>:<fragment cb>:<word> (research, Windows): at the first draw of that
+        // many vertices from that present on, watch who writes that word of its fragment constant buffer (hle/memwatch.c)
+        static int wd_state = -1;
+        static long wd_from, wd_count, wd_cb, wd_word;
+        static unsigned long long wd_fs;  // (optional 5th field: only the draw whose fragment shader has this hash)
+        if (wd_state < 0) {
+            const char *e = getenv("LARECOMP_WATCH_DRAW");
+            wd_state = e && sscanf(e, "%ld:%ld:%ld:%ld:%llx", &wd_from, &wd_count, &wd_cb, &wd_word, &wd_fs) >= 4 ? 0 : 1;
+        }
+        if (!wd_state && (long)renderer_present_count() >= wd_from && (long)r->x[2] == wd_count && wd_cb >= 0 && wd_cb < 18 &&
+            st.ubuf[1][wd_cb].addr && (!wd_fs || g_cur_fs_hash == wd_fs)) {
+            wd_state = 1;
+            extern void memwatch_add(uint64_t addr);
+            uint64_t a = st.ubuf[1][wd_cb].addr + 4 * (uint64_t)wd_word;
+            LOG("[watchdraw] present %llu: watching fcb%ld word %ld at %llx\n", (unsigned long long)renderer_present_count(), wd_cb, wd_word,
+                (unsigned long long)a);
+            memwatch_add(a);
         }
     }
     if (g_debug_frame) debug_draw(pr, r, indexed);
@@ -5035,6 +5209,26 @@ static void draw_(CmdRec *r, bool indexed) {
         if (off < 0) off = getenv("LARECOMP_NO_DEPTH_BIAS") != NULL;
         bool on = (st.poly[3] & 4) && !off;
         if (on) memcpy(f, st.poly_offset, sizeof f);
+        // The game's 24-bit depth (NVN DEPTH24 / DEPTH24_STENCIL8) is D32F here. A constant bias unit is a fixed 2^-24 in
+        // D24 but 2^(e-23) in float depth (e: the primitive's largest depth exponent): near the camera (depth < 0.5)
+        // the game's offsets shrink by 2, 4, ... - the starter court (units -200 over the lawn mesh flush beneath it)
+        // lost to the lawn in a band at the bottom of the Sobble close-up (player report 2026-11-22). Emulate a fixed
+        // unit: a 1024x larger constant clamped to units * 2^-23 (constant for any depth >= 2^-10). 2^-23, not 2^-24:
+        // measured - units * 2^-24 still lost frames 5068/5070/5077/5080, 2x / 4x / 8x the float unit none (Maxwell's
+        // offset unit register is fed units * 2 by nouveau too). Only for a pure constant offset (no slope factor, no
+        // clamp of the game's own). Off: LARECOMP_NO_D24_BIAS=1.
+        static int d24 = -1;
+        if (d24 < 0) d24 = getenv("LARECOMP_NO_D24_BIAS") == NULL;
+        if (on && d24 && !equal_tol && g_vk.depth_bias_clamp && st.rt.depth &&
+            (st.rt.depth->format == 0x33 || st.rt.depth->format == 0x35) && f[0] == 0 && f[2] == 0 && f[1] != 0) {
+            f[2] = f[1] * (2.0f / 16777216.0f);
+            f[1] *= 1024.0f;
+        }
+        {   // (research) LARECOMP_BIAS_MUL=<k>: every constant offset times k, unclamped
+            static float mul = -1;
+            if (mul < 0) mul = getenv("LARECOMP_BIAS_MUL") ? (float)atof(getenv("LARECOMP_BIAS_MUL")) : 0;
+            if (on && mul > 0) f[1] = st.poly_offset[1] * mul, f[2] = 0;
+        }
         if (equal_tol) { f[1] -= 8; on = true; }  // (see the EQUAL comment above: a few depth ulps nearer)
         vkCmdSetDepthBiasEnable(cb, on);
         vkCmdSetDepthBias(cb, f[1], f[2], f[0]);
@@ -5045,6 +5239,12 @@ static void draw_(CmdRec *r, bool indexed) {
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     float tint[8] = {0};  // (the per-draw tint the translator can apply to colour target 0: none)
+    if (dof_linear() && g_cur_fs_hash == DOF_PREP_FS && ao.proj_frame + 2 >= vk_frame_counter() && ao.proj[2] != 1.0f) {
+        // the depth of field's prep (translate.c dof_fix): the scene's near / far, in game units (cm), and 1 / (100 * 360)
+        tint[4] = ao.proj[3] / (ao.proj[2] - 1);
+        tint[5] = ao.proj[3] / (ao.proj[2] + 1);
+        tint[6] = 1.0f / 36000.0f;
+    }
     // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
     if (prof) prof_dyn += SDL_GetTicksNS() - prof_td_;
@@ -5287,9 +5487,11 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
     if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
-    LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
+    LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
         st.channel_mask);
+    if (st.poly[3] & 4) LOG(" bias factor %g units %g clamp %g", st.poly_offset[0], st.poly_offset[1], st.poly_offset[2]);
+    LOG("\n");
     LOG("[draw]   attribs:");  // format / stream / offset per attribute, and the streams' strides
     for (int i = 0; i < st.nattrib; i++)
         if ((pr->vi->attr_mask >> i) & 1)
@@ -5379,15 +5581,27 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         for (int s = 0; s < 2; s++) {
             if (!st.vbuf[s].addr) continue;
             const float *v = (const float *)(uintptr_t)st.vbuf[s].addr;
-            LOG("[draw]   vbuf%d %llx size %llu:", s, (unsigned long long)st.vbuf[s].addr, (unsigned long long)st.vbuf[s].size);
+            uint64_t hsum = 1469598103934665603ull;  // (FNV-1a of the whole range: does its content change frame to frame?)
+            for (uint64_t k = 0; k < st.vbuf[s].size && k < (64u << 20); k++) hsum = (hsum ^ ((const uint8_t *)v)[k]) * 1099511628211ull;
+            LOG("[draw]   vbuf%d %llx size %llu hash %016llx:", s, (unsigned long long)st.vbuf[s].addr, (unsigned long long)st.vbuf[s].size,
+                (unsigned long long)hsum);
             for (int k = 0; k < 16; k++) LOG(" %.4g", v[k]);
             LOG("\n");
         }
-        for (int c = 0; c < 18; c++) {
-            if (!((pr->fi->cbuf_mask >> c) & 1) || !st.ubuf[1][c].addr) continue;
+        for (int c = 0; c < 18; c++) {  // (vertex cbufs too: "vcbN")
+            if (!((pr->vi->cbuf_mask >> (c + 3)) & 1) || !st.ubuf[0][c].addr) continue;  // (game slot c = hardware cb c+3)
+            const float *u = (const float *)(uintptr_t)st.ubuf[0][c].addr;
+            LOG("[draw]   vcbN%d %llx size %u:", c, (unsigned long long)st.ubuf[0][c].addr, (unsigned)st.ubuf[0][c].size);
+            for (int k = 0; k < 160 && k * 4 < (int)st.ubuf[0][c].size; k++) LOG(" %.6g", u[k]);
+            LOG("\n");
+        }
+        static int dbg_words = -1;  // (LARECOMP_DEBUG_DATA_WORDS: how many words of each fragment cbuf, default 96)
+        if (dbg_words < 0) dbg_words = getenv("LARECOMP_DEBUG_DATA_WORDS") ? atoi(getenv("LARECOMP_DEBUG_DATA_WORDS")) : 96;
+        for (int c = 0; c < 18; c++) {  // (game slot c = hardware cb c+3; before 2026-11-21 this tested bit c: "fcbN" = slot N)
+            if (!((pr->fi->cbuf_mask >> (c + 3)) & 1) || !st.ubuf[1][c].addr) continue;
             const float *u = (const float *)(uintptr_t)st.ubuf[1][c].addr;
             LOG("[draw]   fcb%d %llx size %u:", c, (unsigned long long)st.ubuf[1][c].addr, (unsigned)st.ubuf[1][c].size);
-            for (int k = 0; k < 96 && k * 4 < (int)st.ubuf[1][c].size; k++) LOG(" %.6g", u[k]);
+            for (int k = 0; k < dbg_words && k * 4 < (int)st.ubuf[1][c].size; k++) LOG(" %.6g", u[k]);
             LOG("\n");
         }
     }
@@ -5475,6 +5689,43 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
 }
 
+// A readback's copy. A depth texture allocated larger than the guest's (resolution scale: shadow maps at 2x) cannot be
+// filtered down like a colour one, so each guest texel is copied from its place in the larger image (nearest). Without
+// this the CPU read the texel at the GUEST coordinates of the larger image - another place: Sword reads its tree-canopy
+// shadow map (1024x1024 guest, 2048x2048 here) one texel per character to dim the characters standing in shade, and
+// got leaves from elsewhere: the player and the Pokemon "turned dark for a bit" in the open (LARECOMP_RB_NOSCALE=1: old).
+static void rb_copy(VkCommandBuffer cb, VkImage img, VkBuffer buf, const VkBufferImageCopy *c, float sx, float sy,
+                    const TexBackend *b, uint64_t layer_size, uint32_t bpb) {
+    static int noscale = -1;
+    if (noscale < 0) noscale = getenv("LARECOMP_RB_NOSCALE") != NULL;
+    uint32_t w = c->imageExtent.width, h = c->imageExtent.height, nl = c->imageSubresource.layerCount;
+    uint64_t n = (uint64_t)w * h * nl;
+    bool scaled = (sx != 1 || sy != 1) && (c->imageSubresource.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) && c->imageExtent.depth == 1;
+    if (!scaled || noscale || n > 65536) {
+        if (scaled && !noscale) { static int warned; if (!warned++) LOG("[readback] scaled depth region %ux%ux%u too large: copied unscaled\n", w, h, nl); }
+        vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_GENERAL, buf, 1, c);
+        return;
+    }
+    VkBufferImageCopy *r = malloc(sizeof *r * n);
+    if (!r) return;
+    uint32_t rowlen = c->bufferRowLength ? c->bufferRowLength : w;
+    uint64_t k = 0;
+    for (uint32_t l = 0; l < nl; l++)
+        for (uint32_t j = 0; j < h; j++)
+            for (uint32_t i = 0; i < w; i++) {
+                int32_t x = (int32_t)(((float)(c->imageOffset.x + (int32_t)i) + 0.5f) * sx);
+                int32_t y = (int32_t)(((float)(c->imageOffset.y + (int32_t)j) + 0.5f) * sy);
+                if (x >= (int32_t)b->width) x = (int32_t)b->width - 1;
+                if (y >= (int32_t)b->height) y = (int32_t)b->height - 1;
+                r[k++] = (VkBufferImageCopy){.bufferOffset = c->bufferOffset + l * layer_size + ((uint64_t)j * rowlen + i) * bpb,
+                                             .imageSubresource = {c->imageSubresource.aspectMask, c->imageSubresource.mipLevel,
+                                                                  c->imageSubresource.baseArrayLayer + l, 1},
+                                             .imageOffset = {x, y, c->imageOffset.z}, .imageExtent = {1, 1, 1}};
+            }
+    vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_GENERAL, buf, (uint32_t)k, r);
+    free(r);
+}
+
 static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     NvnTexture *t = (NvnTexture *)(uintptr_t)src->tex;
     if (!t || !dst || dst < HEAP_BASE) return;
@@ -5540,7 +5791,7 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
                                                             (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},
                                        .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
                                        .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
-                vkCmdCopyImageToBuffer(cb, srcimg, VK_IMAGE_LAYOUT_GENERAL, rb.buf, 1, &c);
+                rb_copy(cb, srcimg, rb.buf, &c, small_mem ? 1 : tsx, small_mem ? 1 : tsy, b, img, fi->bpb);
                 vk_full_barrier(cb);
                 if (small_mem) rb.img = srcimg, rb.img_mem = small_mem;
                 pthread_mutex_lock(&g_rb_lock);
@@ -5563,10 +5814,56 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
                                                 (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},
                            .imageOffset = {rg[0], rg[1], array ? 0 : rg[2]},
                            .imageExtent = {(uint32_t)rg[3], (uint32_t)rg[4], array ? 1 : nz}};
-    vkCmdCopyImageToBuffer(cb, srcimg, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    rb_copy(cb, srcimg, out.buf, &c, small_mem ? 1 : tsx, small_mem ? 1 : tsy, b, img, fi->bpb);
     renderer_flush();  // the CPU may read the result right after the fence
     memcpy((void *)(uintptr_t)dst, out.ptr, total);
     if (small_mem) vmaDestroyImage(g_vk.vma, srcimg, small_mem);
+    static int rblog = -1;  // LARECOMP_LOG_READBACK=1 (with LARECOMP_READBACK_SYNC=1): each readback and its first bytes
+    if (rblog < 0) rblog = getenv("LARECOMP_LOG_READBACK") != NULL;
+    if (rblog) {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)dst;
+        LOG("[readback] present %llu tex %llx %ux%u f%#x lv %d region %d,%d %dx%d -> %llx size %llu:", (unsigned long long)renderer_present_count(),
+            (unsigned long long)t->addr, t->width, t->height, t->format, level, rg[0], rg[1], rg[3], rg[4], (unsigned long long)dst, (unsigned long long)total);
+        for (uint64_t i = 0; i < total && i < 64; i++) LOG(" %02x", p[i]);
+        LOG("\n");
+    }
+    // LARECOMP_RB_DUMP=<present>,...: at those presents, the whole D32F texture a readback reads -> build/rbtex_<present>.pgm
+    // (depth 0..1 stretched over the image's own min..max, 16-bit), once per present
+    static char rbd[256] = {1};
+    if (rbd[0] == 1) { const char *e = getenv("LARECOMP_RB_DUMP"); snprintf(rbd, sizeof rbd, "%s", e ? e : ""); }
+    static uint64_t dumped_at = ~0ull;
+    uint64_t pc_now = renderer_present_count();
+    if (rbd[0] && t->format == 0x34 && level == 0 && dumped_at != pc_now) {
+        bool want = false;
+        for (const char *q = rbd; *q;) { long v = strtol(q, (char **)&q, 10); if ((uint64_t)v == pc_now) want = true; if (*q == ',') q++; else break; }
+        if (want) {
+            dumped_at = pc_now;
+            uint32_t w = t->width, h = t->height;
+            VkSpan o2 = vk_readback((uint64_t)w * h * 4);
+            VkBufferImageCopy c2 = {.bufferOffset = o2.off, .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
+            VkCommandBuffer cb2 = vk_cmd();
+            vk_full_barrier(cb2);
+            vkCmdCopyImageToBuffer(cb2, b->image, VK_IMAGE_LAYOUT_GENERAL, o2.buf, 1, &c2);
+            renderer_flush();
+            const float *d = (const float *)o2.ptr;
+            float mn = 1e9f, mx = -1e9f;
+            for (uint64_t i = 0; i < (uint64_t)w * h; i++) { if (d[i] < mn) mn = d[i]; if (d[i] > mx) mx = d[i]; }
+            char path[128];
+            snprintf(path, sizeof path, "build/rbtex_%llu.pgm", (unsigned long long)pc_now);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fprintf(f, "P5 %u %u 65535\n", w, h);
+                for (uint64_t i = 0; i < (uint64_t)w * h; i++) {
+                    float n = mx > mn ? (d[i] - mn) / (mx - mn) : 0;
+                    uint16_t s = (uint16_t)(n * 65535.0f);
+                    uint8_t be[2] = {(uint8_t)(s >> 8), (uint8_t)s};
+                    fwrite(be, 1, 2, f);
+                }
+                fclose(f);
+            }
+            LOG("[readback] dumped %s (%ux%u, depth %g..%g)\n", path, w, h, mn, mx);
+        }
+    }
 }
 
 // LARECOMP_WATCH_TEX=<guest addr, hex>: every write to that texture (render target, copy destination, buffer upload)
@@ -5728,9 +6025,9 @@ static VkImageView raw_view(TexBackend *b) {
 static VkPipelineLayout post_layout;
 static VkDescriptorSetLayout post_set_layout;
 
-static VkPipeline post_pipeline(const char *fs) {
-    static struct { const char *fs; VkPipeline p; } cache[8];
-    for (int i = 0; i < 8; i++) if (cache[i].p && cache[i].fs == fs) return cache[i].p;
+static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
+    static struct { const char *fs; VkFormat fmt; VkPipeline p; } cache[16];
+    for (int i = 0; i < 16; i++) if (cache[i].p && cache[i].fs == fs && cache[i].fmt == fmt) return cache[i].p;
     if (!post_layout) {
         VkDescriptorSetLayoutBinding b[3];
         for (uint32_t i = 0; i < 3; i++)
@@ -5760,7 +6057,6 @@ static VkPipeline post_pipeline(const char *fs) {
                                               .pAttachments = &cba};
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn};
-    VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
                                         .pColorAttachmentFormats = &fmt};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -5770,16 +6066,16 @@ static VkPipeline post_pipeline(const char *fs) {
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = post_layout};
     VkPipeline p;
     VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
-    for (int i = 0; i < 8; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].p = p; break; }
+    for (int i = 0; i < 16; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].fmt = fmt; cache[i].p = p; break; }
     return p;
 }
 
 // Post image `i` at w x h (RGBA8, kept until the size changes). 0, 1: SMAA edges / weights, 2: SMAA output,
 // 3, 4: FSR EASU / RCAS.
-static TexBackend *post_image(int i, uint32_t w, uint32_t h) {
-    static TexBackend img[6];  // (0-2 SMAA, 3-4 FSR 1, 5 the colour adjustment)
+static TexBackend *post_image_fmt(int i, uint32_t w, uint32_t h, VkFormat fmt) {
+    static TexBackend img[10];  // (0-2 SMAA, 3-4 FSR 1, 5 the colour adjustment, 6-9 outline_smooth)
     TexBackend *d = &img[i];
-    if (d->image && (d->width != w || d->height != h)) {
+    if (d->image && (d->width != w || d->height != h || d->format != fmt)) {
         vk_views_forget(d);
         vk_defer_image(d->image, d->mem);
         d->image = VK_NULL_HANDLE;
@@ -5787,17 +6083,18 @@ static TexBackend *post_image(int i, uint32_t w, uint32_t h) {
     }
     if (!d->image) {
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
-                                .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .format = fmt, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                                 .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
                                 .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
-        d->format = VK_FORMAT_R8G8B8A8_UNORM; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
+        d->format = fmt; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
         d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
         vk_image_init_layout(vk_cmd(), d->image, d->aspect);
     }
     return d;
 }
+static TexBackend *post_image(int i, uint32_t w, uint32_t h) { return post_image_fmt(i, w, h, VK_FORMAT_R8G8B8A8_UNORM); }
 
 static VkImageView post_view(TexBackend *d) {
     static const VkComponentMapping id = {0};
@@ -5831,15 +6128,17 @@ static VkImageView smaa_lut(int i) {
 
 // One post pass (outside the window image's rendering): srcs (bindings 0..n-1) -> dst, fragment shader `fs`.
 // clear: start from zero (SMAA's edge pass only writes edge pixels; its weights / output read them).
+static VkRect2D g_post_rect;  // (non-empty: post_pass renders only this part of dst - outline_smooth's viewport)
 static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float pc[8],
                       bool clear) {
-    VkPipeline pipe = post_pipeline(fs);  // (before the rendering begins: created inside it, the NVIDIA driver crashed)
+    VkPipeline pipe = post_pipeline(fs, dst->format);  // (before the rendering begins: created inside it, the NVIDIA driver crashed)
     vk_full_barrier(cb);
     VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(dst),
                                     .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                                     .loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                                     .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {dst->width, dst->height}},
+    VkRect2D area = g_post_rect.extent.width ? g_post_rect : (VkRect2D){{0, 0}, {dst->width, dst->height}};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = area,
                           .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &ca};
     vkCmdBeginRendering(cb, &ri);
     VkDescriptorSet ds = vk_alloc_set(post_set_layout);
@@ -5855,7 +6154,7 @@ static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *src
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, post_layout, 0, 1, &ds, 0, NULL);
     VkViewport vp = {0, 0, (float)dst->width, (float)dst->height, 0, 1};
-    VkRect2D sc = {{0, 0}, {dst->width, dst->height}};
+    VkRect2D sc = area;
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
     vkCmdPushConstants(cb, post_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
@@ -5923,6 +6222,45 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         piw = b->width; pih = b->height; pow_ = ow; poh = oh; psm = smaa; pfs = fsr; pco = color;
     }
     return v;
+}
+
+// outlines = smooth (outline_soft.frag): the scene is copied right before Sword's outline pass (outline_pre); after it,
+// each pixel's darkening by the outline is spread over a 3x3 kernel and applied to that copy, written back. The
+// outline is a hard 1-pixel line at the game's render size; this turns its stair steps into gradients. Kernel
+// (centre, edge, corner, gain) default 0.25 0.125 0.0625 1.6; LARECOMP_OUTLINE_SOFT="c,e,k,g" to tune.
+static void outline_pre(TexBackend *tb, VkRect2D r) {
+    if (!tb || !tb->image || tb->samples > 1 || tb->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return;
+    TexBackend *pre = post_image_fmt(6, tb->width, tb->height, tb->format);
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkImageCopy c = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .srcOffset = {r.offset.x, r.offset.y, 0}, .dstOffset = {r.offset.x, r.offset.y, 0},
+                     .extent = {r.extent.width, r.extent.height, 1}};
+    vkCmdCopyImage(cb, tb->image, VK_IMAGE_LAYOUT_GENERAL, pre->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    vk_full_barrier(cb);
+}
+static void outline_smooth(TexBackend *tb, VkRect2D r) {
+    if (!tb || !tb->image || tb->samples > 1 || tb->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return;
+    uint32_t w = tb->width, h = tb->height;
+    static float k[4] = {-1};
+    if (k[0] < 0) {
+        k[0] = 0.25f, k[1] = 0.125f, k[2] = 0.0625f, k[3] = 1.6f;
+        if (getenv("LARECOMP_OUTLINE_SOFT")) sscanf(getenv("LARECOMP_OUTLINE_SOFT"), "%f,%f,%f,%f", &k[0], &k[1], &k[2], &k[3]);
+        LOG("[outline] soft outlines: kernel %g %g %g gain %g\n", k[0], k[1], k[2], k[3]);
+    }
+    TexBackend *pre = post_image_fmt(6, w, h, tb->format), *out = post_image_fmt(9, w, h, tb->format);
+    float m[8] = {k[0], k[1], k[2], k[3], (float)w, (float)h};
+    VkCommandBuffer cb = vk_cmd();
+    VkImageView in[3] = {post_view(pre), raw_view(tb)};
+    g_post_rect = r;
+    post_pass(cb, "outline_soft.frag", in, 2, out, m, false);
+    g_post_rect = (VkRect2D){{0, 0}, {0, 0}};
+    vk_full_barrier(cb);
+    VkImageCopy c = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .srcOffset = {r.offset.x, r.offset.y, 0}, .dstOffset = {r.offset.x, r.offset.y, 0},
+                     .extent = {r.extent.width, r.extent.height, 1}};
+    vkCmdCopyImage(cb, out->image, VK_IMAGE_LAYOUT_GENERAL, tb->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    vk_full_barrier(cb);
 }
 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).

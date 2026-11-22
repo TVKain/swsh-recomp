@@ -155,10 +155,22 @@ static SDL_Scancode cfg_key(void) {
     return k;
 }
 
+// Holding View / Minus (SDL's BACK) HOLD_MS opens the F12 settings, or closes them (menu_apply_window_requests checks
+// the time each frame); with Plus also down it is the "close the game?" combination instead. A short press is the
+// game's Minus as before.
+#define HOLD_MS 800
+static std::atomic<uint64_t> g_back_since{0};  // (SDL_GetTicks when View went down; 0: up)
+static std::atomic<bool> g_back_fired{false};
+static std::atomic<uint64_t> g_hint_at{0};  // (the first controller button of this run: the hint shows for a while)
+static bool back_down, start_down;
+
 bool menu_handle_event(const SDL_Event *e) {
-    static bool back_down, start_down;
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
-    if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_pad = true;
+    if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        g_last_pad = true;
+        uint64_t zero = 0;
+        g_hint_at.compare_exchange_strong(zero, SDL_GetTicks() ? SDL_GetTicks() : 1);
+    }
     bool typing = g_kbd.load() == 1;  // (the name entry: keys are text, not shortcuts)
     if (typing && e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {  // Enter confirms, Esc cancels
         if (e->key.scancode == SDL_SCANCODE_RETURN || e->key.scancode == SDL_SCANCODE_KP_ENTER) { g_kbd = 2; return true; }
@@ -181,7 +193,10 @@ bool menu_handle_event(const SDL_Event *e) {
         }
         if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F11 ||
                                (e->key.scancode == SDL_SCANCODE_RETURN && (e->key.mod & (SDL_KMOD_ALT | SDL_KMOD_GUI))))) {
-            g_settings.fullscreen = !g_settings.fullscreen;
+            // a window <-> the last full screen kind (borderless unless exclusive was chosen)
+            static int last_full = WINDOW_BORDERLESS;
+            if (g_settings.window_mode != WINDOW_WINDOWED) last_full = g_settings.window_mode, g_settings.window_mode = WINDOW_WINDOWED;
+            else g_settings.window_mode = last_full;
             g_want_fullscreen_apply.store(true);
             settings_save();
             return true;
@@ -206,9 +221,15 @@ bool menu_handle_event(const SDL_Event *e) {
         return true;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP: {
         bool down = e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
-        if (e->gbutton.button == SDL_GAMEPAD_BUTTON_BACK) back_down = down;
+        if (e->gbutton.button == SDL_GAMEPAD_BUTTON_BACK) {
+            back_down = down;
+            g_back_since = down ? (SDL_GetTicks() ? SDL_GetTicks() : 1) : 0;
+            if (down) g_back_fired = false;
+            else if (g_back_fired.exchange(false)) return true;  // (the release of a hold that opened / closed the settings)
+        }
         if (e->gbutton.button == SDL_GAMEPAD_BUTTON_START) start_down = down;
         if (down && !typing && ((back_down && start_down) || e->gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE)) {
+            g_back_fired = back_down;  // (not a hold any more)
             set_cfg(false);
             set_open(!g_open.load());
             return true;
@@ -272,7 +293,16 @@ void menu_apply_window_requests(void *win) {
     // F11 / Alt+Enter only: the setting itself is applied where the window is made (ui_window_init) and handed to the game
     // (runtime/ui/launcher_lg.mm window_as_game) - applied here on the first call too, the start screen (which calls this
     // each frame) went back to full screen right after taking its own size
-    if (g_want_fullscreen_apply.exchange(false)) SDL_SetWindowFullscreen(w, g_settings.fullscreen);
+    if (g_want_fullscreen_apply.exchange(false)) {
+        window_apply_mode(w);
+        if (g_settings.window_mode == WINDOW_WINDOWED) window_restore_geometry(w);  // (the size and place it was left at)
+    }
+    // View / Minus held: the settings open (or close)
+    uint64_t since = g_back_since.load();
+    if (since && !g_back_fired.load() && !start_down && g_kbd.load() != 1 && SDL_GetTicks() - since >= HOLD_MS) {
+        g_back_fired = true;
+        set_cfg(!g_cfg.load());
+    }
 }
 
 // ------------------------------------------------------------------ render thread
@@ -385,80 +415,70 @@ extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, in
     return ok;
 }
 
-// "Close the game?" - Não has the focus first (Enter / A by reflex keeps playing); B / Esc answer Não.
+// "Close the game?" - No has the focus first (Enter / A by reflex keeps playing); B / Esc answer No.
 static void quit_draw(ImGuiIO &io, float scale) {
-    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 110));
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(10, 14, 22, 120));
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(520 * scale, 0), ImGuiCond_Always);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, 0);
     ImGui::Begin("##quit", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                      ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::PopStyleColor();
     ui_window_backdrop();
-    ui_title(g_menu_font, M("Close the game?", "Deseja fechar o jogo?", "Закрыть игру?"));
-    const char *lost = M("Progress since the last save will be lost.", "O progresso desde o último save será perdido.",
-                         "Прогресс после последнего сохранения будет потерян.");
-    ImGui::TextDisabled("%s", lost);
-    ImGui::Spacing();
-    // the two answers side by side, Settings under them: together as wide as the text (at least 2 x 240 px)
-    float sp = ImGui::GetStyle().ItemSpacing.x, w = fmaxf(ImGui::CalcTextSize(lost).x, 480 * scale + sp), bw = (w - sp) / 2;
+    ImGui::PushFont(g_menu_font);
+    ImGui::SetWindowFontScale(0.72f);
+    ImGui::TextUnformatted(M("Close the game?", "Fechar o jogo?", "Закрыть игру?"));
+    ImGui::SetWindowFontScale(1);
+    ImGui::PopFont();
+    ImGui::TextDisabled("%s", M("Unsaved progress will be lost.", "O progresso não salvo será perdido.", "Несохранённый прогресс будет потерян."));
+    ImGui::Dummy(ImVec2(0, 14 * scale));
+    ImGui::Indent(ui_inset());
+    float sp = ImGui::GetStyle().ItemSpacing.x, w = ImGui::GetContentRegionAvail().x + ui_inset(), bw = (w - sp) / 2;
     static bool focus_no;
     if (!focus_no) { ImGui::SetKeyboardFocusHere(1); focus_no = true; }
-    if (ImGui::Button(M("Yes", "Sim", "Да"), ImVec2(bw, 0))) {
+    if (ui_button(M("Quit", "Sair", "Выйти"), bw)) {
         settings_save();
         SDL_Event q = {};
         q.type = SDL_EVENT_QUIT;
         SDL_PushEvent(&q);
     }
     ImGui::SameLine();
-    bool no = ImGui::Button(M("No", "Não", "Нет"), ImVec2(bw, 0));
-    if (ImGui::Button(M("Settings (F12)", "Configurações (F12)", "Настройки (F12)"), ImVec2(w, 0))) {
+    bool no = ui_button_primary(M("Keep playing", "Continuar", "Продолжить"), bw);
+    ImGui::Dummy(ImVec2(0, 2 * scale));
+    if (ui_button(M("Settings", "Configurações", "Настройки"), w)) {
         focus_no = false;
         set_cfg(true);  // (closes the question: the way in from a controller)
     } else if (no || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
         set_open(false);
         focus_no = false;
     }
+    ImGui::Unindent(ui_inset());
     ImGui::End();
 }
 
-// A button prompt as in the game's bottom strip: the button (a coloured circle with its letter, or a key's name on a
-// pill) then what it does, from x on the line centred at y. Returns its width; draw = false only measures it.
+// A button prompt for the footer: the key (a small dark circle with its letter, or a key's name on a rounded chip) then
+// what it does, from x on the line centred at y, in the muted colour. Returns its width; draw = false only measures it.
 static float prompt(ImDrawList *dl, float x, float y, const char *key, ImU32 col, const char *text, bool draw) {
-    float h = ImGui::GetFrameHeight() * 0.78f, gap = h * 0.25f;
+    float h = ImGui::GetFrameHeight() * 0.62f, gap = h * 0.35f;
     ImVec2 ks = ImGui::CalcTextSize(key), ts = ImGui::CalcTextSize(text);
-    float kw = strlen(key) == 1 ? h : ks.x + h * 0.7f;
+    float kw = strlen(key) == 1 ? h : ks.x + h * 0.8f;
     if (draw) {
         ImVec2 a(x, y - h * 0.5f), b(x + kw, y + h * 0.5f);
         dl->AddRectFilled(a, b, col, h * 0.5f);
-        dl->AddRect(a, b, IM_COL32(255, 255, 255, 255), h * 0.5f, 0, h * 0.07f);
         dl->AddText(ImVec2(x + (kw - ks.x) * 0.5f, y - ks.y * 0.5f), IM_COL32(255, 255, 255, 255), key);
-        dl->AddText(ImVec2(x + kw + gap, y - ts.y * 0.5f), ImGui::GetColorU32(ImGuiCol_Text), text);
+        if (*text) dl->AddText(ImVec2(x + kw + gap, y - ts.y * 0.5f), ImGui::GetColorU32(UI_MUTED), text);
     }
-    return kw + gap + ts.x;
-}
-
-// The description box: the text of the setting under the cursor (ui_tip), else the page's, on the rows' text column
-// with as much room above it as at its left; at the text's size unless it is longer than the box (smaller then)
-static void description(ImDrawList *dl, ImVec2 a, ImVec2 b, float pad_y, const char *text) {
-    ui_info_box(dl, a, b);
-    float in = ui_inset(), ww = b.x - a.x - in * 2, hh = b.y - a.y - pad_y * 2;
-    ImFont *font = ImGui::GetFont();
-    float size = ImGui::GetFontSize();
-    for (float f = 1.0f; f >= 0.6f; f -= 0.05f) {
-        size = ImGui::GetFontSize() * f;
-        if (font->CalcTextSizeA(size, FLT_MAX, ww, text).y <= hh) break;
-    }
-    dl->AddText(font, size, ImVec2(a.x + in, a.y + pad_y), ImGui::GetColorU32(ImGuiCol_Text), text, NULL, ww);
+    return kw + (*text ? gap + ts.x : 0);
 }
 
 // F12: the settings, applied live (runtime/ui/settings_ui.mm: the start screen's pages); saved to larecomp.ini on closing.
-// B / Esc / F12 close; L / R on a controller change the tab. The look of the game's Options screen: the title and the
-// tabs, the description box, the settings as pills, the button prompts on a white strip at the bottom.
+// B / Esc / F12 / holding View close; L / R on a controller change the tab. A plain card: the title and a segmented
+// tab control, the rows, a footer with the highlighted setting's one-line description and the button prompts.
 static void cfg_draw(ImGuiIO &io, float scale) {
-    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 70));
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(10, 14, 22, 110));
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     // one size for every tab (a page taller than it scrolls; pad navigation follows)
-    float ww = fminf(io.DisplaySize.x * 0.92f, 1120 * scale), wh = fminf(io.DisplaySize.y * 0.92f, 900 * scale);
+    float ww = fminf(io.DisplaySize.x * 0.92f, 980 * scale), wh = fminf(io.DisplaySize.y * 0.90f, 820 * scale);
     ImGui::SetNextWindowSize(ImVec2(ww, wh), ImGuiCond_Always);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, 0);
     ImGui::Begin("##cfg", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
@@ -469,91 +489,105 @@ static void cfg_draw(ImGuiIO &io, float scale) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
     float fh = ImGui::GetFrameHeight();
-    bool popup = ImGui::IsPopupOpen((const char *)NULL, ImGuiPopupFlags_AnyPopupId);
+    bool popup = ImGui::IsPopupOpen((const char *)NULL, ImGuiPopupFlags_AnyPopupId), pad = g_last_pad.load();
+    enum { NTAB = 3 };
 
-    // the title, and the tabs at its right as pills between L and R (a click picks one too)
-    ui_title(g_menu_font, M("Settings", "Configurações", "Настройки"));
+    // the title, and at its right the tabs as a segmented control (L / R beside it on a controller; a click picks one)
+    ImGui::PushFont(g_menu_font);
+    ImGui::SetWindowFontScale(0.72f);
+    ImGui::TextUnformatted(M("Settings", "Configurações", "Настройки"));
+    ImGui::SetWindowFontScale(1);
+    ImGui::PopFont();
     ImVec2 t0 = ImGui::GetItemRectMin(), t1 = ImGui::GetItemRectMax();
-    if (!popup) ui_tabs_begin(&g_cfg_tab, 2);
+    if (!popup) ui_tabs_begin(&g_cfg_tab, NTAB);
     {
-        // (Let's Go Recomp's third tab, Advanced, holds its motion vectors and SSAO / GI views: not here)
-        const char *names[] = {M("Graphics", "Gráficos", "Графика"), M("Image and sound", "Imagem e som", "Изображение и звук")};
-        float pad = fh * 0.55f, gap = st.ItemSpacing.x, chip = fh * 0.95f, w[2], total = chip * 2 + gap * 3;
-        for (int t = 0; t < 2; t++) total += w[t] = ImGui::CalcTextSize(names[t]).x + pad * 2;
-        float x = wp.x + ws.x - st.WindowPadding.x - total, y = (t0.y + t1.y) * 0.5f;
-        auto shoulder = [&](float cx, const char *k) {  // L / R: a dark rounded chip
-            ImVec2 a(cx, y - fh * 0.36f), b(cx + chip, y + fh * 0.36f), ks = ImGui::CalcTextSize(k);
-            dl->AddRectFilled(a, b, IM_COL32(32, 56, 100, 255), fh * 0.2f);
-            dl->AddText(ImVec2(cx + (chip - ks.x) * 0.5f, y - ks.y * 0.5f), IM_COL32(255, 255, 255, 255), k);
+        const char *names[NTAB] = {M("Graphics", "Gráficos", "Графика"), M("Image & sound", "Imagem e som", "Звук и изображение"),
+                                   M("Controls", "Controles", "Управление")};
+        float sp = fh * 0.6f, in = 4 * scale, w[NTAB], total = in * 2, chip = pad ? fh * 0.62f : 0, gap = 10 * scale;
+        for (int t = 0; t < NTAB; t++) total += w[t] = ImGui::CalcTextSize(names[t]).x + sp * 2;
+        float x = wp.x + ws.x - st.WindowPadding.x - total - (pad ? (chip + gap) * 2 : 0), y = (t0.y + t1.y) * 0.5f, h = fh * 0.86f;
+        auto shoulder = [&](float cx, const char *k) {
+            if (!pad) return;
+            ImVec2 a(cx, y - chip * 0.5f), b(cx + chip, y + chip * 0.5f), ks = ImGui::CalcTextSize(k);
+            dl->AddRectFilled(a, b, ImGui::GetColorU32(UI_MUTED), chip * 0.3f);
+            dl->AddText(ImVec2(cx + (chip - ks.x) * 0.5f, y - ks.y * 0.5f), IM_COL32_WHITE, k);
         };
         shoulder(x, "L");
-        x += chip + gap;
+        if (pad) x += chip + gap;
+        dl->AddRectFilled(ImVec2(x, y - h * 0.5f), ImVec2(x + total, y + h * 0.5f), IM_COL32(226, 230, 236, 255), 10 * scale);
+        x += in;
         ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
-        for (int t = 0; t < 2; t++) {
-            ImVec2 a(x, y - fh * 0.5f), b(x + w[t], y + fh * 0.5f);
+        for (int t = 0; t < NTAB; t++) {
+            ImVec2 a(x, y - h * 0.5f + in), b(x + w[t], y + h * 0.5f - in);
             ImGui::SetCursorScreenPos(a);
             ImGui::PushID(t);
-            if (ImGui::InvisibleButton("##tab", ImVec2(w[t], fh))) g_cfg_tab = t;
+            if (ImGui::InvisibleButton("##tab", ImVec2(w[t], b.y - a.y))) g_cfg_tab = t;
             ImGui::PopID();
             bool sel = g_cfg_tab == t;
-            ui_pill(dl, a, b, sel);
-            if (!sel && ImGui::IsItemHovered()) dl->AddRect(a, b, ImGui::GetColorU32(ImGuiCol_Border), fh * 0.5f, 0, 2.5f * scale);
+            if (sel) dl->AddRectFilled(a, b, IM_COL32_WHITE, 8 * scale);
             ImVec2 ts = ImGui::CalcTextSize(names[t]);
-            dl->AddText(ImVec2(a.x + (w[t] - ts.x) * 0.5f, y - ts.y * 0.5f), ImGui::GetColorU32(sel ? ImGuiCol_Text : ImGuiCol_TextDisabled), names[t]);
-            x += w[t] + gap;
+            dl->AddText(ImVec2(a.x + (w[t] - ts.x) * 0.5f, y - ts.y * 0.5f), ImGui::GetColorU32(sel ? UI_TEXT : UI_MUTED), names[t]);
+            x += w[t];
         }
         ImGui::PopItemFlag();
-        shoulder(x, "R");  // (the row ends on the box's right edge)
-        ImGui::SetCursorScreenPos(ImVec2(t0.x, fmaxf(t1.y, y + fh * 0.5f) + 16 * scale));
+        shoulder(x + in + gap, "R");
+        ImGui::SetCursorScreenPos(ImVec2(t0.x, fmaxf(t1.y, y + h * 0.5f) + 18 * scale));
     }
 
-    // the description box: two lines of text
-    {
-        float pad_y = ui_inset() * 0.75f;
-        ImVec2 a = ImGui::GetCursorScreenPos(), b(wp.x + ws.x - st.WindowPadding.x, a.y + ImGui::GetTextLineHeight() * 2 + pad_y * 2);
-        const char *d = ui_tip_last();
-        description(dl, a, b, pad_y, d ? d : M("Changes apply at once and are saved when this menu closes. Left / right change the highlighted setting.",
-                                        "As mudanças valem na hora e são salvas ao fechar este menu. Esquerda / direita mudam a opção destacada.",
-                                        "Изменения применяются сразу и сохраняются при закрытии меню. Влево / вправо — изменить выбранный параметр."));
-        ImGui::Dummy(ImVec2(b.x - a.x, b.y - a.y + 16 * scale - st.ItemSpacing.y));  // (16 px to the page, as above the box)
-    }
-
-    // the page, above the strip at the bottom: as wide as the box (the cursor's arrow in the window's margin)
-    float strip = fh * 1.45f, page_h = wp.y + ws.y - strip - st.ItemSpacing.y - ImGui::GetCursorScreenPos().y;
+    // the page, above the footer
+    float foot = fh * 1.3f, page_h = wp.y + ws.y - foot - st.WindowPadding.y * 0.5f - ImGui::GetCursorScreenPos().y;
     bool known = swsh60_known();
     ImGui::PushID(g_cfg_tab);  // (each page its own scroll)
     ui_page_begin("##page", ImVec2(0, page_h));
     static int shown = -1;  // (another page: the cursor on its first setting)
     if (shown != g_cfg_tab && shown >= 0 && GImGui->NavCursorVisible) ImGui::SetKeyboardFocusHere();
     shown = g_cfg_tab;
-    if (g_cfg_tab == 0) ui_page_graphics(ui_graphics_x(NULL, 0), known);
-    else ui_page_image_sound();
+    if (g_cfg_tab == 0) {
+        const char *extra[] = {ui_window_mode_label()};
+        float x = ui_graphics_x(extra, 1);
+        int wm = g_settings.window_mode;
+        if (ui_window_mode_row(x, &wm)) { g_settings.window_mode = wm; g_want_fullscreen_apply.store(true); }
+        ui_page_graphics(x, known);
+    } else if (g_cfg_tab == 1) {
+        ui_page_image_sound();
+    } else {
+        const char *l[] = {M("Controller layout", "Layout do controle", "Раскладка контроллера"),
+                           M("Stick dead zone", "Zona morta do analógico", "Мёртвая зона стика"),
+                           M("Mouse sensitivity", "Sensibilidade do mouse", "Чувствительность мыши")};
+        float x = ui_label_x(l, 3);
+        ui_layout_combo(x);
+        ui_row(l[1], x);
+        ui_slider("##dead", &g_settings.stick_deadzone, 0.0f, 0.40f, "%.2f", 0.01f);
+        ui_row(l[2], x);
+        ui_slider("##mouse", &g_settings.mouse_sens, 0.02f, 0.30f, "%.2f", 0.01f);
+    }
     ui_page_end();
     ImGui::PopID();
 
-    // the strip: L / R change the tab, B closes (Esc / F12 on a keyboard); a click on Close closes too
+    // the footer: a hairline, the highlighted setting's description at the left, the prompts at the right
     bool close = !popup && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false);
     {
-        ImVec2 a(wp.x, wp.y + ws.y - strip), b(wp.x + ws.x, wp.y + ws.y);
-        dl->AddRectFilled(a, b, IM_COL32(255, 255, 255, 245), st.WindowRounding, ImDrawFlags_RoundCornersBottom);
-        float y = (a.y + b.y) * 0.5f, x = b.x - st.WindowPadding.x, sp = fh * 0.7f;
-        bool pad = g_last_pad.load();
-        const char *l_close = M("Close", "Fechar", "Закрыть"), *l_tab = M("Tabs", "Abas", "Вкладки");
+        ImVec2 a(wp.x + st.WindowPadding.x, wp.y + ws.y - foot - st.WindowPadding.y * 0.4f), b(wp.x + ws.x - st.WindowPadding.x, wp.y + ws.y - st.WindowPadding.y * 0.4f);
+        dl->AddLine(a, ImVec2(b.x, a.y), IM_COL32(226, 230, 236, 255), 1.5f * scale);
+        float y = (a.y + b.y) * 0.5f, x = b.x;
+        const char *l_close = M("Close", "Fechar", "Закрыть");
         char k_close[48];
-        snprintf(k_close, sizeof k_close, pad ? "B" : "Esc / %s", SDL_GetScancodeName(cfg_key()));
-        ImU32 orange = IM_COL32(18, 110, 228, 255), grey = IM_COL32(32, 56, 100, 255);  // (Sword's blue for B)
-        float wc = prompt(dl, 0, 0, k_close, orange, l_close, false);
+        snprintf(k_close, sizeof k_close, pad ? "B" : "Esc");
+        ImU32 dark = IM_COL32(60, 66, 78, 255);
+        float wc = prompt(dl, 0, 0, k_close, dark, l_close, false);
         x -= wc;
-        prompt(dl, x, y, k_close, pad ? orange : grey, l_close, true);
+        prompt(dl, x, y, k_close, dark, l_close, true);
         ImGui::SetCursorScreenPos(ImVec2(x, y - fh * 0.5f));
         ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
         if (ImGui::InvisibleButton("##close", ImVec2(wc, fh))) close = true;
         ImGui::PopItemFlag();
-        if (pad) {  // (L R  Tabs)
-            float wl = prompt(dl, 0, 0, "L", grey, "", false), wt = wl + prompt(dl, 0, 0, "R", grey, l_tab, false);
-            x -= sp + wt;
-            prompt(dl, x, y, "L", grey, "", true);
-            prompt(dl, x + wl, y, "R", grey, l_tab, true);
+        const char *d = ui_tip_last();
+        if (d) {
+            float maxw = x - a.x - 24 * scale;
+            ImVec2 ts = ImGui::CalcTextSize(d);
+            ImGui::PushStyleColor(ImGuiCol_Text, UI_MUTED);
+            ImGui::RenderTextEllipsis(dl, ImVec2(a.x, y - ts.y * 0.5f), ImVec2(a.x + maxw, y + ts.y * 0.5f), a.x + maxw, a.x + maxw, d, NULL, &ts);
+            ImGui::PopStyleColor();
         }
     }
     ImGui::End();
@@ -591,7 +625,11 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
     float prep_frac = 0;
     int prep = shader_prep_progress(&prep_frac);
-    if (!open && !cfg && !kbd && !g_settings.show_fps && !finger && !prep) {
+    // the View / Minus hold: a hint the first time a controller is used, a bar while it is held
+    uint64_t t = SDL_GetTicks(), hint_at = g_hint_at.load(), since = g_back_since.load();
+    bool hint = hint_at && t - hint_at < 7000 && !open && !cfg && !kbd;
+    float hold = since && !g_back_fired.load() && !start_down && !kbd && t - since > 150 ? (float)(t - since) / HOLD_MS : 0;
+    if (!open && !cfg && !kbd && !g_settings.show_fps && !finger && !prep && !hint && !hold) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -629,6 +667,17 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         dl->AddCircle(ImVec2(fx, fy), r, IM_COL32(255, 255, 255, 235), 0, 4 * scale);
     }
     if (prep && !open && !cfg) prep_draw(io, scale, prep, prep_frac);
+    if (hint || hold) {
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y - 24 * scale), 0, ImVec2(0.5f, 1));
+        ImGui::SetNextWindowBgAlpha(0.88f);
+        ImGui::Begin("##holdhint", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+                                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
+        const char *txt = cfg ? M("Hold  -  / View: close the settings", "Segure  -  / View: fechar as configurações", "Удерживайте  -  / View: закрыть настройки")
+                              : M("Hold  -  / View: settings", "Segure  -  / View: configurações", "Удерживайте  -  / View: настройки");
+        ImGui::TextUnformatted(txt);
+        if (hold) ImGui::ProgressBar(hold < 1 ? hold : 1, ImVec2(ImGui::CalcTextSize(txt).x, 8 * scale), "");
+        ImGui::End();
+    }
     if (open) quit_draw(io, scale);
     else if (cfg && !kbd) cfg_draw(io, scale);
     if (kbd) keyboard_draw(io, scale);

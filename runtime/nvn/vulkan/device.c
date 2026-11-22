@@ -269,6 +269,7 @@ static void create_device(void) {
     b->textureCompressionBC = h->textureCompressionBC;
     b->shaderInt64 = h->shaderInt64;
     b->depthBiasClamp = h->depthBiasClamp;
+    g_vk.depth_bias_clamp = h->depthBiasClamp;  // (exec.c: the game's D24 depth offsets)
     b->depthClamp = h->depthClamp;
     g_vk.depth_clamp = h->depthClamp;  // (exec.c: nvnCommandBufferSetDepthClamp)
     b->largePoints = h->largePoints;
@@ -649,9 +650,22 @@ void backend_present(NvnTexture *t) {
     if (have) {
         double dw = g_vk.sc_extent.width, dh = g_vk.sc_extent.height;
         // render scale + placement in the window (the game's 16:9 image, fitted): runtime/nvn/output_scale.c;
-        // no GPU timer here (-1): dynamic resolution goes by the frame time
+        // GPU time: the submissions' timestamps (exec.c vk_gpu_ns_total), finished since the last present - they land
+        // a frame or two late, so single values jitter; dynamic resolution averages ~30 of them
+        extern uint64_t vk_gpu_ns_total(void);
+        extern bool vk_gpu_timing(void);
+        static uint64_t gpu_last;
+        uint64_t gpu_now = vk_gpu_ns_total();
+        double gpu_ms = vk_gpu_timing() && gpu_last && gpu_now >= gpu_last ? (double)(gpu_now - gpu_last) / 1e6 : -1;
+        {   // LARECOMP_GPU_LOG=1: the mean GPU time per present, every 300 presents (A/B of GPU-side features)
+            static int on = -1;
+            static double sum; static int n;
+            if (on < 0) on = getenv("LARECOMP_GPU_LOG") != NULL;
+            if (on && gpu_ms >= 0) { sum += gpu_ms; if (++n == 300) { LOG("[gpu] present %llu: %.2f ms mean\n", (unsigned long long)total_frames, sum / n); sum = 0; n = 0; } }
+        }
+        gpu_last = gpu_now ? gpu_now : 1;
         OutScale os;
-        output_scale(dw, dh, false, SDL_GetTicksNS() / 1e9, -1, &os);
+        output_scale(dw, dh, false, SDL_GetTicksNS() / 1e9, gpu_ms, &os);
         double sx = os.sx, sy = os.sy, vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh;
         float crop[4] = {0, 0, 1, 1};  // uv origin and size: the whole image
         {   // where the game image is in the window (pixels): the mouse as a finger on the touch screen (hle/input.c)
@@ -726,7 +740,13 @@ void backend_present(NvnTexture *t) {
             if (total_frames % 60 == 0) fflush(csv);
             static long exit_at = -1;
             if (exit_at < 0) exit_at = getenv("LARECOMP_EXIT_AT_PRESENT") ? atol(getenv("LARECOMP_EXIT_AT_PRESENT")) : 0;
-            if (exit_at && (long)total_frames >= exit_at) { LOG("[vk] exit at present %llu\n", (unsigned long long)total_frames); fflush(csv); fflush(stderr); _exit(0); }
+            if (exit_at && (long)total_frames >= exit_at) {
+                // (keep the caches like a normal exit does: _exit skipped them, so every test run rebuilt the same
+                // pipeline parts and showed 150-530 ms link holds the player's sessions do not have)
+                LOG("[vk] exit at present %llu\n", (unsigned long long)total_frames); fflush(csv); fflush(stderr);
+                if (g_vk.dev) { vkDeviceWaitIdle(g_vk.dev); vk_pipeline_cache_save(); vk_parts_cache_save(); }
+                _exit(0);
+            }
         }
     }
     {   // LARECOMP_RENDERDOC_AT=<frame>: under RenderDoc (renderdoccmd capture), capture the frame after that one
@@ -846,6 +866,71 @@ static void quick_exit_handler(void) {
 #endif
 }
 
+// ---- the window mode (settings.h WINDOW_*) and the window's size and place, remembered in larecomp.ini
+void window_apply_mode(void *wp) {
+    SDL_Window *w = wp;
+    int m = g_settings.window_mode;
+    g_settings.fullscreen = m != WINDOW_WINDOWED;
+    if (getenv("LARECOMP_WINDOW") || getenv("LARECOMP_HIDDEN")) m = WINDOW_WINDOWED;  // (test windows stay windows)
+    if (m == WINDOW_WINDOWED) {
+        SDL_SetWindowFullscreen(w, false);
+        return;
+    }
+    // exclusive: the display's own mode (its resolution and refresh rate); borderless: NULL, a desktop-sized window
+    const SDL_DisplayMode *dm = m == WINDOW_FULLSCREEN ? SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(w)) : NULL;
+    if (!SDL_SetWindowFullscreenMode(w, dm)) LOG("[window] full screen mode: %s\n", SDL_GetError());
+    SDL_SetWindowFullscreen(w, true);
+    LOG("[window] %s\n", m == WINDOW_FULLSCREEN ? "exclusive full screen" : "borderless full screen");
+}
+
+// The size and place last left (centred when that place is on no display now, e.g. a monitor unplugged)
+void window_restore_geometry(void *wp) {
+    SDL_Window *w = wp;
+    if (getenv("LARECOMP_WINDOW")) {
+        int ww = 1280, wh = 720;
+        sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &ww, &wh);
+        SDL_SetWindowSize(w, ww, wh);
+        SDL_SetWindowPosition(w, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        return;
+    }
+    SDL_SetWindowSize(w, g_settings.win_w, g_settings.win_h);
+    bool placed = false;
+    if (g_settings.win_x != INT_MIN) {
+        int n = 0;
+        SDL_DisplayID *ids = SDL_GetDisplays(&n);
+        for (int i = 0; i < n && !placed; i++) {
+            SDL_Rect r;
+            // (its title bar's middle on that display)
+            if (SDL_GetDisplayUsableBounds(ids[i], &r) && g_settings.win_x + g_settings.win_w / 2 >= r.x &&
+                g_settings.win_x + g_settings.win_w / 2 < r.x + r.w && g_settings.win_y >= r.y && g_settings.win_y < r.y + r.h - 40)
+                placed = true;
+        }
+        SDL_free(ids);
+    }
+    if (placed) SDL_SetWindowPosition(w, g_settings.win_x, g_settings.win_y);
+    else SDL_SetWindowPosition(w, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    if (g_settings.win_max) SDL_MaximizeWindow(w);
+    LOG("[window] %dx%d at %s%d,%d%s\n", g_settings.win_w, g_settings.win_h, placed ? "" : "(centred) ", g_settings.win_x,
+        g_settings.win_y, g_settings.win_max ? ", maximized" : "");
+}
+
+// (window moved / resized / maximized while it is a window: remembered for the next start)
+void window_remember(void *wp) {
+    SDL_Window *w = wp;
+    SDL_WindowFlags f = SDL_GetWindowFlags(w);
+    if (f & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN) || getenv("LARECOMP_WINDOW")) return;
+    if (getenv("LARECOMP_WINDOW_LOG")) {
+        int ww = 0, wh = 0, x = 0, y = 0;
+        SDL_GetWindowSize(w, &ww, &wh), SDL_GetWindowPosition(w, &x, &y);
+        LOG("[window] now %dx%d at %d,%d flags %llx\n", ww, wh, x, y, (unsigned long long)f);
+    }
+    g_settings.win_max = (f & SDL_WINDOW_MAXIMIZED) != 0;
+    if (g_settings.win_max) return;  // (the size under it stays the one it comes back to)
+    int ww, wh, x, y;
+    if (SDL_GetWindowSize(w, &ww, &wh) && ww >= 320 && wh >= 180) g_settings.win_w = ww, g_settings.win_h = wh;
+    if (SDL_GetWindowPosition(w, &x, &y)) g_settings.win_x = x, g_settings.win_y = y;
+}
+
 void ui_window_init(void) {
     if (window) return;
     atexit(quick_exit_handler);
@@ -853,15 +938,17 @@ void ui_window_init(void) {
     settings_load();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
     input_load_user_mappings();
-    int win_w = 1280, win_h = 720;
+    int win_w = g_settings.win_w, win_h = g_settings.win_h;
     if (getenv("LARECOMP_WINDOW")) sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &win_w, &win_h);
     SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (getenv("LARECOMP_HIDDEN")) wflags |= SDL_WINDOW_HIDDEN;
     window = SDL_CreateWindow(RT_APP_NAME, win_w, win_h, wflags);
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
-    // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
-    if (g_settings.fullscreen && !getenv("LARECOMP_WINDOW") && !getenv("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
+    // the window as last left (its place, maximized, the window mode); the start screen takes its own shape over it and
+    // gives it back on Play (runtime/ui/launcher_lg.mm window_as_game); test windows stay windows
+    window_restore_geometry(window);
+    window_apply_mode(window);
     create_instance();
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
     pick_device();
@@ -904,8 +991,13 @@ int ui_run(void) {
         while (SDL_WaitEventTimeout(&e, 16)) {
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
+                window_remember(window);
+                settings_save();  // (the window's mode, size and place for the next start)
                 exit(0);
             }
+            if (e.type == SDL_EVENT_WINDOW_RESIZED || e.type == SDL_EVENT_WINDOW_MOVED || e.type == SDL_EVENT_WINDOW_MAXIMIZED ||
+                e.type == SDL_EVENT_WINDOW_RESTORED)
+                window_remember(window);
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing
             if (menu_handle_event(&e)) continue;
             input_handle_event(&e);

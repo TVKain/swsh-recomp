@@ -71,7 +71,7 @@ def run(name, game, frames, save, fps, turbo, extra):
     env.update(env_keys)
     t0 = time.time()
     with open(log, 'w') as lf:
-        p = subprocess.Popen([os.path.join(ROOT, 'build', 'lasrecomp.exe'), root, '--play'], cwd=ROOT, env=env,
+        p = subprocess.Popen([os.path.join(ROOT, 'build', 'PokemonSword.exe'), root, '--play'], cwd=ROOT, env=env,
                              stdout=lf, stderr=subprocess.STDOUT)
         txt = ''
         while time.time() - t0 < 3600:

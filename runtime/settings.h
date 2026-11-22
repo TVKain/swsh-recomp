@@ -22,9 +22,20 @@ enum { FX_OFF = 0, FX_LOW = 1, FX_MEDIUM = 2, FX_HIGH = 3, FX_ULTRA = 4 };  // (
 enum { VREAD_AUTO = 0, VREAD_COPY = 1, VREAD_DIRECT = 2 };
 // the game's (each of its taps a hard in / out), each tap bilinear (2x2 PCF), each tap a 3x3 tent (4 bilinear lookups)
 enum { SHADOW_GAME = 0, SHADOW_BILINEAR = 1, SHADOW_SMOOTH = 2 };
+// Sword's character / object outlines (a screen-space edge pass at the game's render size): off, the game's, smoothed
+// (SMAA on the scene right after them, before the game scales it up: runtime/nvn/vulkan/exec.c outline_smooth)
+enum { OUTLINE_OFF = 0, OUTLINE_ON = 1, OUTLINE_SMOOTH = 2 };
+
+// The window (launcher Graphics page, F12 graphics page; F11 / Alt+Enter step through them): a window, borderless full
+// screen (a window the size of the display: Alt+Tab is instant) or exclusive full screen (the display's own mode)
+enum { WINDOW_WINDOWED = 0, WINDOW_BORDERLESS = 1, WINDOW_FULLSCREEN = 2 };
 
 typedef struct {
-    bool fullscreen;
+    bool fullscreen;     // (window_mode != WINDOW_WINDOWED: kept for older code paths and older versions' files)
+    int window_mode;     // WINDOW_*, remembered: the next start opens the same way
+    int win_w, win_h;    // the window's size and place as last left (windowed); win_x INT_MIN: centred
+    int win_x, win_y;
+    bool win_max;        // maximized
     int fps;  // 30 (the game's own), 60 or 120 (experimental): the world's rate (runtime/hle/fps60.c; F12 menu, live)
     int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
     int res_height;      // the launcher's render height in lines (720 / 1080 / 1440 / 2160); 0: res_mode decides
@@ -56,6 +67,7 @@ typedef struct {
     int frame_gen;        // frame generation: 0 off, FG_AUTO, 2 / 3 / 4 images per world frame (exec.c frame interpolation, any GPU)
     bool blur_quality;    // the game's downsample / blur / depth-of-field composite read better (runtime/nvn/vulkan/exec.c fx_patch_fs)
     bool ui2x;            // the interface textures at 2x when cache/ui2x.pak was made (start screen; runtime/ui2x.c)
+    int outlines;         // OUTLINE_* (F12 menu, live)
     int shadow_filter;    // SHADOW_*: how the shadow map is filtered (F12 menu; textures.c vk_sampler, translate.c shpcf)
     // screen-space indirect light, one bounce (F12 menu / advanced; runtime/nvn/vulkan/exec.c gi_run). World units ~cm
     bool gi;
@@ -89,5 +101,10 @@ extern Settings g_settings;
 
 void settings_load(void);
 void settings_save(void);
+// The window (runtime/nvn/vulkan/device.c; SDL_Window *): window_mode applied (main thread), the windowed size and place
+// as last left, and noted again after a move / resize
+void window_apply_mode(void *sdl_window);
+void window_restore_geometry(void *sdl_window);
+void window_remember(void *sdl_window);
 void settings_clamp_color(void);  // brightness / contrast / saturation / SSAO into their ranges
 void settings_apply_levels(void);  // the SSAO / GI parameters from their levels, the upscaler from the anti-aliasing and pick

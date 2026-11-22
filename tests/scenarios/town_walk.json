@@ -1,0 +1,2 @@
+{"description": "Player's save (Postwick, before the starter): load, then walk up 60 frames; speed check 30 vs 60 and an outdoor look", "save": "build/scenario-saves/user_town",
+ "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8,2720:STICK_UP:60", "exit_at": 2900, "measure": [2400, 2900], "shots": [2700, 2800, 2880]}
