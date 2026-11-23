@@ -4,6 +4,7 @@
 // (runtime/gamebuild.c). Runs on a background thread; the launcher polls its state.
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,6 +57,10 @@ const char *game_version(const char *exefs);
 // unpacked with nstool). NULL: only rebuild the game code from files set up already. A folder without extracted
 // files but with .xci / .nsp in it is unpacked too.
 void setup_start(const char *folder);
+// The console keys (prod.keys) for unpacking .xci / .nsp: a copy kept in <data root>/keys (setup_import_keys: the
+// player's file, checked to be one), else an emulator's. where = the file found.
+bool setup_keys_found(char *where, size_t n);
+bool setup_import_keys(const char *path);  // false: not a prod.keys / couldn't copy
 int setup_state(void);         // SETUP_*
 float setup_progress(void);    // 0..1 while running
 bool setup_running(void);

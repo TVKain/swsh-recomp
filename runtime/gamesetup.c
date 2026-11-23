@@ -21,6 +21,9 @@
 #include "platform.h"
 #include "romfs_build.h"
 
+#define KEYS_DIR "keys"
+#define KEYS_FILE KEYS_DIR "/prod.keys"
+
 #define ROOT "extracted"  // (in the data root, the working directory)
 // The games (program ids, main.npdm's ACI0), any version. The 60 fps and wild battles options and the generator's
 // instruction patches are addresses in Let's Go's main: only the builds with address tables get them (game_build);
@@ -152,9 +155,10 @@ static bool image_ok(void) {
 }
 
 // (not while a setup runs: its romfs.bin is still being written - checking it each frame read and logged a half image)
-bool setup_ready(void) {
-    return !g_running && game_ok(ROOT "/exefs") && image_ok() && gamelib_present(ROOT);
+static bool files_ready(void) {  // (the setup thread's own check: setup_ready is false while it runs)
+    return game_ok(ROOT "/exefs") && image_ok() && gamelib_present(ROOT);
 }
+bool setup_ready(void) { return !g_running && files_ready(); }
 
 bool setup_needs_build(void) {
     return !g_running && game_ok(ROOT "/exefs") && image_ok() && !gamelib_present(ROOT);
@@ -198,6 +202,7 @@ static void find_game(const char *dir, int depth, Found *f) {
         snprintf(p, sizeof p, "%s/%s", dir, n);
         if (has_ext(n, ".xci") || has_ext(n, ".nsp") || has_ext(n, ".nca") || has_ext(n, ".nsz") || has_ext(n, ".xcz"))
             f->package = true;
+        if (!strcmp(n, "prod.keys") && is_file(p) && !is_file(KEYS_FILE)) setup_import_keys(p);  // (keys in the folder)
         if ((has_ext(n, ".xci") || has_ext(n, ".nsp")) && f->npkgs < MAX_PKGS && is_file(p))
             snprintf(f->pkgs[f->npkgs++], sizeof f->pkgs[0], "%s", p);
         if (nsub < 64 && strcmp(n, "bin") && is_dir(p)) snprintf(sub[nsub++], sizeof sub[0], "%s", n);
@@ -251,9 +256,66 @@ static void unpack_kill(void) {
 static bool find_nstool(char *out, size_t n) {
     return rt_resource("nstool" PLAT_EXE_SUFFIX, "third_party/nstool/nstool" PLAT_EXE_SUFFIX, out, n);
 }
+// Keys the player gave us (setup_import_keys: picked with the game files, found next to them, or the Game page's
+// "Console keys" row) are kept in the data root, so they are found again on every later setup.
+
+static bool keys_valid(const char *p) {  // (a prod.keys has the header key in it: not just any text file)
+    FILE *f = fopen(p, "rb");
+    if (!f) return false;
+    char line[512];
+    bool ok = false;
+    for (int i = 0; i < 4000 && !ok && fgets(line, sizeof line, f); i++) {
+        const char *c = line;
+        while (*c == ' ' || *c == '\t') c++;
+        ok = !strncmp(c, "header_key", 10);
+    }
+    fclose(f);
+    return ok;
+}
+
+static bool copy_small(const char *src, const char *dst) {
+    FILE *a = fopen(src, "rb");
+    if (!a) return false;
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.part", dst);
+    FILE *b = fopen(tmp, "wb");
+    if (!b) { fclose(a); return false; }
+    char buf[65536];
+    size_t k;
+    bool ok = true;
+    while (ok && (k = fread(buf, 1, sizeof buf, a)) > 0) ok = fwrite(buf, 1, k, b) == k;
+    fclose(a);
+    ok = fclose(b) == 0 && ok;
+    remove(dst);
+    if (ok) ok = rename(tmp, dst) == 0;
+    else remove(tmp);
+    return ok;
+}
+
+bool setup_import_keys(const char *path) {
+    if (!path || !is_file(path) || !keys_valid(path)) {
+        LOG("[setup] %s: not a prod.keys file\n", path ? path : "(none)");
+        return false;
+    }
+    mkdir(KEYS_DIR, 0755);
+    char a[4096], b[4096];
+    if (realpath(path, a) && realpath(KEYS_FILE, b) && !strcmp(a, b)) return true;  // (ours already)
+    if (!copy_small(path, KEYS_FILE)) { LOG("[setup] couldn't copy %s\n", path); return false; }
+    char t[1100];  // (title.keys next to it: not needed for cartridge dumps, copied when there)
+    snprintf(t, sizeof t, "%s", path);
+    char *sl = strrchr(t, '/'), *bs = strrchr(t, '\\');
+    if (bs > sl) sl = bs;
+    char *name = sl ? sl + 1 : t;
+    snprintf(name, sizeof t - (size_t)(name - t), "title.keys");
+    if (is_file(t)) copy_small(t, KEYS_DIR "/title.keys");
+    LOG("[setup] keys imported from %s\n", path);
+    return true;
+}
+
 static bool find_keys(char *out, size_t n) {
     const char *e = getenv("LARECOMP_KEYS");
     if (e && is_file(e)) return (size_t)snprintf(out, n, "%s", e) < n;
+    if (is_file(KEYS_FILE)) return (size_t)snprintf(out, n, "%s/%s", rt_data_root(), KEYS_FILE) < n;
     if (rt_resource("prod.keys", "third_party/nstool/prod.keys", out, n)) return true;
     const char *app = getenv("APPDATA"), *home = getenv("USERPROFILE");
     if (!home) home = getenv("HOME");
@@ -270,6 +332,13 @@ static bool find_keys(char *out, size_t n) {
     }
     if (home && (snprintf(p, sizeof p, "%s/.switch/prod.keys", home), is_file(p))) return (size_t)snprintf(out, n, "%s", p) < n;
     return false;
+}
+
+bool setup_keys_found(char *where, size_t n) {
+    char p[1100];
+    if (!find_keys(p, sizeof p)) return false;
+    if (where && n) snprintf(where, n, "%s", p);
+    return true;
 }
 
 // nstool refuses a path with both '/' and '\\' in it: one kind per argument
@@ -477,7 +546,7 @@ static void *setup_thread(void *arg) {
     g_progress = 0;
     if (!g_folder[0]) {  // only the game code (files set up already, e.g. a new version of the app)
         LOG("[setup] the game files are set up, the game code is from another version: rebuilding it\n");
-        if (build_code()) g_state = setup_ready() ? SETUP_DONE : SETUP_FAIL_BUILD;
+        if (build_code()) g_state = files_ready() ? SETUP_DONE : SETUP_FAIL_BUILD;
         g_running = false;
         return NULL;
     }
@@ -486,11 +555,22 @@ static void *setup_thread(void *arg) {
     memset(&f, 0, sizeof f);
     if (strchr(g_folder, '\n') || (is_file(g_folder) && (has_ext(g_folder, ".xci") || has_ext(g_folder, ".nsp")))) {
         // picked package files (one per line)
-        for (char *save = NULL, *p = strtok_r(g_folder, "\n", &save); p && f.npkgs < MAX_PKGS; p = strtok_r(NULL, "\n", &save))
+        for (char *save = NULL, *p = strtok_r(g_folder, "\n", &save); p && f.npkgs < MAX_PKGS; p = strtok_r(NULL, "\n", &save)) {
+            if (has_ext(p, ".keys")) { if (has_ext(p, "prod.keys")) setup_import_keys(p); continue; }  // (picked with them)
             if (is_file(p)) snprintf(f.pkgs[f.npkgs++], sizeof f.pkgs[0], "%s", p);
+        }
         f.package = true;
     } else
         find_game(g_folder, 0, &f);
+    if (f.npkgs && !setup_keys_found(NULL, 0))  // (a prod.keys in the folder of a package: taken too)
+        for (int i = 0; i < f.npkgs; i++) {
+            char k[1100];
+            snprintf(k, sizeof k, "%s", f.pkgs[i]);
+            char *sl = strrchr(k, '/');
+            if (!sl) continue;
+            snprintf(sl + 1, sizeof k - (size_t)(sl + 1 - k), "prod.keys");
+            if (is_file(k) && setup_import_keys(k)) break;
+        }
     LOG("[setup] %s: exefs %s, romfs %s, romfs.bin %s, %d package(s)\n", g_folder, f.exefs[0] ? f.exefs : "-",
         f.romfs[0] ? f.romfs : "-", f.romfs_bin[0] ? f.romfs_bin : "-", f.npkgs);
     bool unpacked = false;
@@ -543,7 +623,7 @@ static void *setup_thread(void *arg) {
         LOG("[setup] the game data image %s: %s\n", f.romfs_bin[0] ? f.romfs_bin : "(built)", why);
         g_state = SETUP_FAIL_IMAGE;
     } else if (getenv("LARECOMP_SETUP_NO_BUILD")) g_state = SETUP_DONE;  // (tests: the files only, no game code)
-    else if (build_code()) g_state = setup_ready() ? SETUP_DONE : SETUP_FAIL_BUILD;
+    else if (build_code()) g_state = files_ready() ? SETUP_DONE : SETUP_FAIL_BUILD;
     LOG("[setup] %s\n", g_state == SETUP_DONE ? "ready" : "failed");
     g_running = false;
     return NULL;

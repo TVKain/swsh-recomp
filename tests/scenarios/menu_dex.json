@@ -1,0 +1,26 @@
+{
+ "description": "Pokedex list: hold DOWN (cursor repeat + list scroll) 30 vs 60 (MENU60, player's save with a Pokedex)",
+ "save": "build/scenario-saves/user_dex",
+ "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8,1700:X:4,1760:A:4,1840:A:4,1920:DOWN:40",
+ "exit_at": 2000,
+ "measure": [
+  1910,
+  2000
+ ],
+ "shots": [
+  1910,
+  1920,
+  1924,
+  1928,
+  1932,
+  1936,
+  1940,
+  1944,
+  1948,
+  1952,
+  1956,
+  1960,
+  1964,
+  1968
+ ]
+}

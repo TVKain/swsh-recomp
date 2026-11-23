@@ -1,0 +1,1 @@
+{"description": "Player save 2026-11-22 22:07 (4 Pokemon + trainer nearby): load and stand still, fps check", "save": "build/scenario-saves/user_busy", "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8", "exit_at": 4000, "measure": [2400, 4000], "shots": [2400, 2600, 2800, 3000, 3200, 3400, 3600, 3800]}

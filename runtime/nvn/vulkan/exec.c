@@ -1,4 +1,5 @@
 // Executes recorded NVN command lists with Vulkan (port of renderer.m; same structure, same behaviour).
+#include <ctype.h>
 #include <SDL3/SDL_cpuinfo.h>
 #include <immintrin.h>
 #include <SDL3/SDL_timer.h>
@@ -18,6 +19,7 @@
 #include "../renderer.h"
 #include "../../settings.h"
 #include "dlss.h"
+#include "xess.h"
 
 static uint64_t g_draws_total;  // (never reset: LARECOMP_COUNTER_LOG)
 static void watch_tex(NvnTexture *t, const char *what, const NvnTexture *from);  // (LARECOMP_WATCH_TEX, below)
@@ -1453,7 +1455,41 @@ static struct {
     float hist_vp[4];
     int hist_mode;
 } taa;
-static bool taa_wanted(void) { return g_settings.antialias == AA_TAA || g_settings.antialias == AA_DLAA; }
+static bool taa_wanted(void) { return g_settings.antialias == AA_TAA || g_settings.antialias == AA_DLAA || g_settings.antialias == AA_XESS; }
+// XeSS upscaling (aa = xess, xess_quality not native). Sword draws its 3D scene into part of its 1080p targets (80% in
+// the open, 100% indoors), tone-maps it there, then ONE draw (this fragment program) scales it to the whole target and
+// copies its depth along; the HUD is drawn after it. Here every target before that draw (the scene's) is allocated at
+// renderer_scene_scale() of the output's size, the targets of that draw and of every pass after it (the HUD's, the
+// window's) at the output's (textures.c vk_tex_mark_output), taa_run leaves the camera's motion vectors and the depth,
+// and right after the game's own upscale XeSS writes the target's colour from the tone-mapped scene (xess_upscale).
+// The scene's draws are jittered as for TAA, over Intel's sequence length (8 x ratio^2). Found 2026-11-22 in Postwick
+// (debug frame: tone map fs c2df9c49 into the scene's 1536x864, this draw t0 = that image x cb3[0].x, t1 = its depth).
+#define SCENE_UPSCALE_FS 0x0ad7badee02b1c3dull
+static struct {
+    uint64_t code;             // the upscale draw's fragment code address (learnt from its hash on its first draw)
+    uint64_t seen_frame;       // the last frame it was drawn in (the passes after it are output targets)
+    uint64_t prep_frame;       // the frame taa_run left the vectors and the depth for it
+    TexBackend *mv, *dz;       // those (fx_image 3 and 6), the scene's images' size w x h, its part rw x rh from the corner
+    uint32_t w, h, rw, rh;
+    float jx, jy;
+    bool reset;
+    uint64_t runs, fails;
+    NvnTexture *id[2];         // the scene's two extra targets of its 3-target pass (characters: cleared, then only the
+    uint64_t id_frame, dump_at, mask_frame;// character draws write them - the outlines read them): the responsive mask's source
+} xu;
+// XeSS (any mode) replaces the game's own scene upscale: "Native" keeps the game's scene size (80% outdoors, 100% indoors)
+// and XeSS rebuilds the full image from it, instead of the game's bilinear stretch after a 1x XeSS pass (that stretch was
+// the blur); the other modes draw the scene smaller by Intel's ratio.
+static float xu_f = 0.8f;  // (the game's last fraction: the upscale draw's cb3[0].x)
+static bool xu_native(void) { return g_settings.antialias == AA_XESS && xess_available() && xess_upscale_ratio() <= 1.0f &&
+                                     !getenv("LARECOMP_XESS_MODE_A"); }
+static bool xu_full(void) { return xu_native() && g_settings.xess_quality == XESS_Q_FULL; }  // (native AA at full size)
+static bool xu_on(void) { return xess_upscale_ratio() > 1.0f || xu_native(); }
+static float xu_ratio(void) { return xu_full() ? 1.0f : xu_native() ? 1.0f / xu_f : xess_upscale_ratio(); }
+void renderer_get_scale(float *sx, float *sy);
+void renderer_set_scene_scale(float k);
+float renderer_scene_scale(void);
+bool vk_tex_mark_output(NvnTexture *t);
 // Depth of field input (CLAUDE.md "Rose close-up"): Sword's DOF chain compares its input with layer distances in
 // metres / 360 (f_70004a7e70), but its prep shader (this hash) passes the raw depth buffer through (alpha = depth *
 // (f-n)/f): near subjects came out blurred (Rose's close-up in the opening). The prep's alpha is made linear distance
@@ -1469,16 +1505,119 @@ static float halton(uint32_t i, uint32_t b) {
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
+
+// ---- object motion vectors (TAA / XeSS). The game gives no motion vectors, and the camera's (taa_mv.frag, from the
+// depth) are wrong on anything that moves by itself: characters' arms smeared and "waved" under XeSS, ghosts behind
+// them under TAA. The scene's passes get one more colour target (RGBA16F, g_mv_slot) and every opaque draw there that
+// was also drawn last frame uses a variant of its program (mv_vs_text / mv_fs_text) that writes its own vector: its
+// vertex shader runs once more with last frame's constant buffers (mv_store / mv_prev: bones, object, camera). Where no
+// such draw wrote (sky, effects, a draw new this frame, a variant still being built) the camera's vectors stay
+// (mv_merge.frag). Variants and their pipelines are made in the background: nothing waits for them.
+// LARECOMP_NO_OBJ_MV=1: off.
+static int g_mv_slot = -1;        // this pass's motion-vector target (-1: none)
+static uint64_t g_mv_frame;       // the frame the motion-vector image was cleared in
+static TexBackend *g_mv_img;
+static uint64_t stat_mv_draws, stat_mv_noprev, stat_mv_building, stat_mv_obj;
+static bool mv_on(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_OBJ_MV") != NULL;
+    return !off && (xu_on() || g_settings.antialias == AA_TAA || g_settings.antialias == AA_XESS || g_settings.antialias == AA_DLAA);
+}
+static TexBackend *fx_image(int i, uint32_t w, uint32_t h, VkFormat f);
+static VkImageView ssao_view(TexBackend *d);
+// last frame's constant buffers per draw: a table of draw keys -> copies, two of them (this frame, the last one)
+typedef struct { uint64_t key; uint32_t off[18], size[18]; } MvSnap;
+#define MV_TAB 8192
+static struct { MvSnap *tab; uint8_t *arena; size_t used, cap; uint64_t frame; } g_mvs[2];
+static MvSnap *mv_slot(int t, uint64_t key, bool add) {
+    if (!g_mvs[t].tab) g_mvs[t].tab = calloc(MV_TAB, sizeof(MvSnap));
+    uint32_t i = (uint32_t)(key ^ (key >> 29)) & (MV_TAB - 1);
+    for (int n = 0; n < MV_TAB; n++, i = (i + 1) & (MV_TAB - 1)) {
+        if (g_mvs[t].tab[i].key == key) return &g_mvs[t].tab[i];
+        if (!g_mvs[t].tab[i].key) return add ? &g_mvs[t].tab[i] : NULL;
+    }
+    return NULL;
+}
+// this draw's key (what it is and which object it belongs to; the n-th draw of the same kind in the frame gets n mixed
+// in), its constant buffers kept for the next frame; returns the key
+static uint64_t mv_store(CmdRec *r, bool indexed, ShaderInfo *si) {
+    uint64_t fr = vk_frame_counter();
+    int t = (int)(fr & 1);
+    if (g_mvs[t].frame != fr) {
+        g_mvs[t].frame = fr;
+        if (g_mvs[t].tab) memset(g_mvs[t].tab, 0, MV_TAB * sizeof(MvSnap));
+        g_mvs[t].used = 0;
+    }
+    uint64_t h = 0xcbf29ce484222325ull ^ (uint64_t)(uintptr_t)st.program ^ ((uint64_t)indexed << 63);
+    h = (h ^ st.program->stages[0].code_addr) * 0x100000001B3ull;
+    h = (h ^ st.vbuf[0].addr) * 0x100000001B3ull;
+    for (int i = 0; i < 8; i++) h = (h ^ r->x[i]) * 0x100000001B3ull;
+    if (st.obj) h = (h ^ st.obj) * 0x100000001B3ull;
+    if (!h) h = 1;
+    MvSnap *e = mv_slot(t, h, true);
+    while (e && e->key) { h = h * 0x100000001B3ull + 1; if (!h) h = 1; e = mv_slot(t, h, true); }
+    if (!e) return 0;
+    memset(e, 0, sizeof *e);
+    e->key = h;
+    for (int c = 0; c < 15; c++) {
+        int k = c + 3;
+        if (!((si->cbuf_mask >> k) & 1) || !st.ubuf[0][c].addr) continue;
+        Range rg = st.ubuf[0][c];
+        uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
+        if ((si->cbuf_dynamic & (1u << k)) && rg.size) size = rg.size > 0x10000 ? 0x10000 : rg.size;
+        if (size > rg.size && rg.size) size = rg.size;
+        if (size < 16) size = 16;
+        if (g_mvs[t].used + size + 256 > g_mvs[t].cap) {
+            size_t nc = g_mvs[t].cap ? g_mvs[t].cap * 2 : (8u << 20);
+            while (nc < g_mvs[t].used + size + 256) nc *= 2;
+            g_mvs[t].arena = realloc(g_mvs[t].arena, nc);
+            g_mvs[t].cap = nc;
+        }
+        memcpy(g_mvs[t].arena + g_mvs[t].used, (const void *)(uintptr_t)rg.addr, size);
+        e->off[c] = (uint32_t)g_mvs[t].used;
+        e->size[c] = (uint32_t)size;
+        g_mvs[t].used += (size + 255) & ~(size_t)255;
+    }
+    return h;
+}
+static const MvSnap *mv_prev(uint64_t key) {
+    uint64_t fr = vk_frame_counter();
+    int t = (int)((fr + 1) & 1);
+    if (!key || g_mvs[t].frame + 1 != fr) return NULL;
+    return mv_slot(t, key, false);
+}
+static const MvSnap *g_mv_cur;  // (stage_set: the draw's last-frame buffers, bindings 100 + N)
+static float mv_ysign(void) {  // (the objects' NDC y runs the other way to the camera vectors' uv: measured on a walk; LARECOMP_OBJ_MV_YSIGN)
+    static float y;
+    if (!y) y = getenv("LARECOMP_OBJ_MV_YSIGN") ? (float)atof(getenv("LARECOMP_OBJ_MV_YSIGN")) : -1.0f;
+    return y;
+}
+
 static int debug_pass_no;
+static uint64_t g_cur_fs_hash;  // (the current draw's fragment shader hash)
 
 static void vk_end_pass_at(int line);
 void vk_end_pass(void) { vk_end_pass_at(0); }
 #define vk_end_pass() vk_end_pass_at(__LINE__)
+// a jittered pass's (unjittered) viewport rectangle, and whether one of its viewports was jittered - edge_inward
+static float g_jit_rect[4];
+static bool g_jit_drawn;
+static void edge_inward(VkCommandBuffer cb, TexBackend *t, int32_t x0, int32_t y0, uint32_t rw, uint32_t rh);
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
     if (prof && line < 4096) prof_end_line[line]++;
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
+    if (g_jit_drawn) {  // (every target of a jittered pass: its never-drawn edge rows / columns - edge_inward)
+        g_jit_drawn = false;
+        int32_t x = (int32_t)floorf(g_jit_rect[0] + 0.5f), y = (int32_t)floorf(g_jit_rect[1] + 0.5f);
+        uint32_t w = (uint32_t)floorf(g_jit_rect[2] + 0.5f), h = (uint32_t)floorf(g_jit_rect[3] + 0.5f);
+        for (int i = 0; i < st.rt.ncolor && i < 8; i++)
+            if (st.rt.color[i] && st.rt.color[i]->backend && ((TexBackend *)st.rt.color[i]->backend)->samples <= 1)
+                edge_inward(vk_cmd(), st.rt.color[i]->backend, x, y, w, h);
+        if (st.rt.depth && st.rt.depth->backend && ((TexBackend *)st.rt.depth->backend)->samples <= 1)
+            edge_inward(vk_cmd(), st.rt.depth->backend, x, y, w, h);
+    }
     if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
         char path[256];
         static uint64_t debug_pass_frame = ~0ull;
@@ -1487,6 +1626,13 @@ static void vk_end_pass_at(int line) {
         if (multi && renderer_present_count() != debug_pass_frame) { debug_pass_frame = renderer_present_count(); debug_pass_no = 0; }
         if (multi) snprintf(path, sizeof path, "build/pass_%llu_%03d.png", (unsigned long long)debug_pass_frame, debug_pass_no++);
         else snprintf(path, sizeof path, "build/pass_%03d.png", debug_pass_no++);
+        {   // (the pass list of the frame: target, its size and format, the viewport, the last draw's fragment hash)
+            TexBackend *tb = st.rt.color[0]->backend;
+            LOG("[passlist] %s: c0 @%llx %ux%u fmt %d (%d colour, depth %s), viewport %.0f,%.0f %.0fx%.0f, fs %016llx\n", path,
+                (unsigned long long)st.rt.color[0]->addr, tb->width, tb->height, (int)tb->format, st.rt.ncolor,
+                st.rt.depth ? "yes" : "no", st.viewport[0][0], st.viewport[0][1], st.viewport[0][2], st.viewport[0][3],
+                (unsigned long long)g_cur_fs_hash);
+        }
         renderer_save_texture_tex(st.rt.color[0]->backend, path);
     }
 }
@@ -1494,32 +1640,108 @@ static void vk_end_pass_at(int line) {
 static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v : 1; }
 
 
+// The previous frame's first scene candidate's depth (XeSS: its depth pre-pass is jittered too - in wild-battle intros the
+// scene has < 16 opaque draws and a later render becomes the candidate, so scene_d named that one when the pre-pass came)
+static uint64_t g_first_d, g_first_d_prev;
 // begin_pass, TAA on: whether this pass's draws are jittered, whether the scene is resolved before it
 static void taa_pass_check(bool has_d) {
     uint64_t fr = vk_frame_counter();
-    if (taa.jit_frame != fr) {  // (Halton 2, 3 over 8 frames)
+    if (taa.jit_frame != fr) {  // (Halton 2, 3 over 8 frames; XeSS upscaling: over 8 x ratio^2, Intel's guidance)
         taa.jit_frame = fr;
-        uint32_t i = (uint32_t)(fr % 8) + 1;
+        float r = xu_on() ? xu_ratio() : 1.0f;
+        uint32_t len = r > 1.0f ? (uint32_t)ceilf(8.0f * r * r) : 8;
+        uint32_t i = (uint32_t)(fr % len) + 1;
         taa.jx = halton(i, 2) - 0.5f, taa.jy = halton(i, 3) - 0.5f;
+        static int nojit = -1;  // (research) LARECOMP_NO_JITTER=1: no sub-pixel jitter
+        if (nojit < 0) nojit = getenv("LARECOMP_NO_JITTER") != NULL;
+        if (nojit) taa.jx = taa.jy = 0;
     }
     uint64_t da = has_d && st.rt.depth ? st.rt.depth->addr : 0;
     uint64_t ca = pass_ncolor && st.rt.color[0] ? st.rt.color[0]->addr : 0;
     // the scene's passes (its depth: the depth-only pass first; its colour with a depth: the blended draws on their own
     // depth), until the resolve - and only while it keeps resolving (else the image would shake)
-    if (taa.done_frame != fr && taa.ok_frame + 2 >= fr && taa.ok_frame && pass_samples == 1 &&
-        ((da && da == taa.scene_d) || (da && ca && ca == taa.scene_c)))
+    // XeSS upscaling takes the finished image: every pass on the scene's depth keeps the frame's jitter, also after the
+    // vectors' place (in wild-battle intros it comes before the colour pass that tests EQUAL against the jittered depth
+    // pre-pass: most of the background failed the test and stayed the clear colour - grey).
+    if ((taa.done_frame != fr || (xu_on() && taa.jit_used == fr)) && taa.ok_frame + 2 >= fr && taa.ok_frame && pass_samples == 1 &&
+        ((da && da == taa.scene_d) || (da && ca && ca == taa.scene_c) || (xu_on() && da && da == g_first_d_prev)))
         taa.jit_pass = true, taa.jit_used = fr;
+    if (g_debug_frame && getenv("LARECOMP_PASSES_DEBUG"))
+        LOG("[jit] pass d @%llx c @%llx: jit %d (done %llu ok %llu used %llu fr %llu scene_d %llx scene_c %llx)\n", (unsigned long long)da,
+            (unsigned long long)ca, (int)taa.jit_pass, (unsigned long long)taa.done_frame, (unsigned long long)taa.ok_frame,
+            (unsigned long long)taa.jit_used, (unsigned long long)fr, (unsigned long long)taa.scene_d, (unsigned long long)taa.scene_c);
     // after the scene's effects ran (the SSAO's place: ao.done_frame), the first pass on another colour target
     if (ao.dtex && ao.ctex && ao.done_frame == fr && taa.done_frame != fr && ca && ca != ao.ctex->addr) taa.pending = true;
 }
 
+static bool pass_drop_depth;  // (XeSS upscaling: this pass is drawn without its depth - see begin_pass)
+static bool g_passlog;        // (LARECOMP_PASSES_AT: this pass is logged)
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
+    pass_drop_depth = false;
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
     st.rt_dirty = false;
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
+    {
+        extern volatile int g_out_fixed;  // (output_scale.c: no dynamic resolution while XeSS upscales)
+        g_out_fixed = xu_on();
+    }
+    {   // LARECOMP_PASSES_AT=<first>-<last> (presents): each pass's targets, sizes and viewport (the frame's map)
+        static int a = -2, b;
+        if (a == -2) {
+            const char *e = getenv("LARECOMP_PASSES_AT");
+            a = e ? atoi(e) : -1;
+            b = e && strchr(e, '-') ? atoi(strchr(e, '-') + 1) : a;
+        }
+        uint64_t pc = renderer_present_count();
+        g_passlog = (a >= 0 && pc >= (uint64_t)a && pc <= (uint64_t)b) || (g_debug_frame && getenv("LARECOMP_PASSES_DEBUG"));
+        if (g_passlog) {
+            NvnTexture *c0 = st.rt.ncolor ? st.rt.color[0] : NULL, *d = st.rt.depth;
+            LOG("[passes] p%llu f%llu: %d colour c0 @%llx %ux%u fmt %#x%s | depth @%llx%s | viewport %.0f,%.0f %.0fx%.0f | k %.3f, upscale %s\n",
+                (unsigned long long)pc, (unsigned long long)vk_frame_counter(), st.rt.ncolor, c0 ? (unsigned long long)c0->addr : 0ull,
+                c0 ? c0->width : 0, c0 ? c0->height : 0, c0 ? c0->format : 0,
+                c0 && c0->backend && ((TexBackend *)c0->backend)->out ? " OUT" : "", d ? (unsigned long long)d->addr : 0ull,
+                d && d->backend && ((TexBackend *)d->backend)->out ? " OUT" : "", st.viewport[0][0], st.viewport[0][1],
+                st.viewport[0][2], st.viewport[0][3], renderer_scene_scale(), xu.seen_frame == vk_frame_counter() ? "seen" : "-");
+        }
+    }
+    if (fabsf(renderer_scene_scale() - 1.0f) > 1e-4f || xu_on()) {  // (XeSS upscaling: see SCENE_UPSCALE_FS)
+        uint64_t fr = vk_frame_counter();
+        // a pass with an output target (the upscale's, the window's): all its targets are (one pass, one size). Not
+        // "every pass after the upscale draw": the game records the next frame's scene before this frame is presented.
+        // Only a colour target carries it over (to the depth): the upscale's depth is also bound, untested and unwritten,
+        // to the pass that blends the half-size effects into the scene's HDR image (fs 3535a843) - that pass is drawn
+        // without it (pass_drop_depth below).
+        bool after = false, scene_colour = false;
+        for (int i = 0; i < st.rt.ncolor; i++) {
+            TexBackend *cb_ = st.rt.color[i] ? st.rt.color[i]->backend : NULL;
+            if (cb_ && (cb_->out || cb_->presented)) after = true;  // (the window's images: textures.c target_scale)
+            else if (cb_ && cb_->scalable && !cb_->shadow) scene_colour = true;
+        }
+        TexBackend *db_ = st.rt.depth ? st.rt.depth->backend : NULL;
+        if (!after && scene_colour && db_ && db_->out && fabsf(renderer_scene_scale() - 1.0f) > 1e-4f) {
+            pass_drop_depth = true;
+            static int nlog;
+            if (nlog++ < 4)
+                LOG("[xess] a scene pass (c0 @%llx) with the output's depth @%llx bound: drawn without it\n",
+                    (unsigned long long)st.rt.color[0]->addr, (unsigned long long)st.rt.depth->addr);
+        }
+        if (after) {
+            bool n = false;
+            for (int i = 0; i < st.rt.ncolor; i++) n |= vk_tex_mark_output(st.rt.color[i]);
+            n |= vk_tex_mark_output(st.rt.depth);
+            if (n) LOG("[xess] (a pass on %d colour target(s), c0 @%llx, depth @%llx, at present %llu, upscale seen %s)\n",
+                       st.rt.ncolor, st.rt.ncolor && st.rt.color[0] ? (unsigned long long)st.rt.color[0]->addr : 0ull,
+                       st.rt.depth ? (unsigned long long)st.rt.depth->addr : 0ull,
+                       (unsigned long long)renderer_present_count(), xu.seen_frame == fr ? "this frame" : "not this frame");
+        }
+        if (fabsf(renderer_scene_scale() - 1.0f) > 1e-4f && (!xu_on() || fr > xu.seen_frame + 60)) {
+            LOG("[xess] upscaling %s: the scene back at the output's size\n", xu_on() ? "draw not seen for 60 frames" : "off");
+            renderer_set_scene_scale(1.0f);
+        }
+    }
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -1604,7 +1826,7 @@ static void begin_pass(void) {
         }
     pass_depth = pass_stencil = VK_FORMAT_UNDEFINED;
     bool has_d = false, has_s = false;
-    if (st.rt.depth) {
+    if (st.rt.depth && !pass_drop_depth) {
         renderer_mark_gpu_owned(st.rt.depth);
         VkImageView v = vk_view(st.rt.depth, &st.rt.dview, st.rt.has_dview, true, TEXTYPE_2D);
         TexBackend *b = st.rt.depth->backend;
@@ -1622,6 +1844,30 @@ static void begin_pass(void) {
             if (!pass_ncolor) pass_samples = b->samples;
         }
     }
+    g_mv_slot = -1;
+    if (mv_on() && has_d && pass_ncolor >= 1 && pass_ncolor < 8 && pass_samples == 1 && st.rt.color[0] && ca[0].imageView &&
+        st.rt.color[0]->backend && ((TexBackend *)st.rt.color[0]->backend)->scalable &&
+        (st.rt.depth->addr == taa.scene_d || st.rt.depth->addr == g_first_d_prev) &&
+        (pass_color[0] == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || pass_color[0] == VK_FORMAT_R16G16B16A16_SFLOAT ||
+         pass_color[0] == VK_FORMAT_R32G32B32A32_SFLOAT)) {
+        TexBackend *c0 = st.rt.color[0]->backend;
+        uint64_t fr = vk_frame_counter();
+        g_mv_img = fx_image(14, c0->width, c0->height, VK_FORMAT_R16G16B16A16_SFLOAT);
+        uint32_t s = pass_ncolor;
+        ca[s] = (VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = ssao_view(g_mv_img),
+                                            .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                                            .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        if (g_mv_frame != fr) { ca[s].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; g_mv_frame = fr; }  // (alpha 0: no object)
+        pass_color[s] = VK_FORMAT_R16G16B16A16_SFLOAT;
+        pass_ncolor = s + 1;
+        g_mv_slot = (int)s;
+        if (g_mv_img->width < minw) minw = g_mv_img->width;
+        if (g_mv_img->height < minh) minh = g_mv_img->height;
+    }
+    if (g_passlog)
+        LOG("[passes]   vk formats c0 %d c1 %d c2 %d (n %u), motion-vector target %d, depth is scene %d / first %d\n",
+            (int)pass_color[0], (int)pass_color[1], (int)pass_color[2], pass_ncolor, g_mv_slot,
+            st.rt.depth && st.rt.depth->addr == taa.scene_d, st.rt.depth && st.rt.depth->addr == g_first_d_prev);
     if (!w) { pass_sx = pass_sy = 1; minw = minh = 16; }
     pass_w = minw; pass_h = minh;
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = 1,
@@ -1635,12 +1881,13 @@ static void begin_pass(void) {
     taa.pending = taa.jit_pass = false;
     if ((g_settings.ssao || taa_wanted() || dof_linear()) && !ao.busy) {
         uint64_t fr = vk_frame_counter();
-        if (ao.frame != fr) { ao.frame = fr; ao.opaque = 0; ao.dtex = ao.ctex = NULL; }
+        if (ao.frame != fr) { ao.frame = fr; ao.opaque = 0; ao.dtex = ao.ctex = NULL; g_first_d_prev = g_first_d; g_first_d = 0; }
         TexBackend *c0 = pass_ncolor && ca[0].imageView && st.rt.color[0] ? st.rt.color[0]->backend : NULL;
         VkFormat f = pass_color[0];
         bool scene = c0 && c0->scalable && has_d && pass_samples == 1 && st.rt.color[0]->width >= 640 &&
                      (f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || f == VK_FORMAT_R16G16B16A16_SFLOAT || f == VK_FORMAT_R32G32B32A32_SFLOAT);
         if (scene && ao.opaque < 16 && (ao.dtex != st.rt.depth || ao.ctex != st.rt.color[0])) {
+            if (!ao.dtex) g_first_d = st.rt.depth ? st.rt.depth->addr : 0;  // (the frame's first candidate)
             ao.dtex = st.rt.depth; ao.ctex = st.rt.color[0]; ao.opaque = 0;  // (the first, or a better candidate)
         }
         if (scene && ao.dtex == st.rt.depth && ao.ctex == st.rt.color[0]) {
@@ -1654,6 +1901,17 @@ static void begin_pass(void) {
         if (ao.dtex && ao.ctex) taa.scene_d = ao.dtex->addr, taa.scene_c = ao.ctex->addr;
     }
     if (taa_wanted() && !ao.busy) taa_pass_check(has_d);
+    if (xu_on() && pass_ncolor >= 3 && ao.ctex && st.rt.color[0] == ao.ctex && st.rt.color[1] && st.rt.color[2]) {
+        xu.id[0] = st.rt.color[1], xu.id[1] = st.rt.color[2], xu.id_frame = vk_frame_counter();
+        static int dumped = -1;  // LARECOMP_XESS_DUMPID=<present>: both images at that present -> build/xess_id<k>.png
+        if (dumped < 0) dumped = getenv("LARECOMP_XESS_DUMPID") ? atoi(getenv("LARECOMP_XESS_DUMPID")) : 0;
+        if (dumped > 0 && renderer_present_count() >= (uint64_t)dumped) {
+            dumped = 0;
+            LOG("[xess] id targets: @%llx fmt %#x, @%llx fmt %#x\n", (unsigned long long)xu.id[0]->addr, xu.id[0]->format,
+                (unsigned long long)xu.id[1]->addr, xu.id[1]->format);
+            xu.dump_at = vk_frame_counter();
+        }
+    }
 }
 
 static void pass_size(int *w, int *h) {
@@ -1706,7 +1964,11 @@ static void set_viewport(float x, float y, float w, float h, float zn, float zf,
     if (ao.qual) {  // (the SSAO rebuilds positions within the scene's viewport)
         ao.vp[0] = vp.x, ao.vp[1] = vp.height < 0 ? vp.y + vp.height : vp.y, ao.vp[2] = vp.width, ao.vp[3] = fabsf(vp.height);
     }
-    if (taa.jit_pass) vp.x += taa.jx, vp.y += taa.jy;  // (TAA: the content moves by the jitter, in this pass's pixels)
+    if (taa.jit_pass) {  // (TAA: the content moves by the jitter, in this pass's pixels)
+        g_jit_rect[0] = vp.x, g_jit_rect[1] = vp.height < 0 ? vp.y + vp.height : vp.y, g_jit_rect[2] = vp.width, g_jit_rect[3] = fabsf(vp.height);
+        g_jit_drawn = taa.jx != 0 || taa.jy != 0;
+        vp.x += taa.jx, vp.y += taa.jy;
+    }
     vkCmdSetViewport(vk_cmd(), 0, 1, &vp);
 }
 
@@ -1866,6 +2128,7 @@ typedef struct {
     bool vs_uses_vid;
     uint64_t chash[2];  // the stages' content hashes (NvnShaderStage.content_hash; 0 unknown): pipeline recipes
     _Atomic int state;  // 0 building, 1 ready, 2 failed
+    int motion;         // object motion vectors: 0 the game's program, k + 1 the variant writing them to colour slot k
 } Prog;
 
 // A layout of one stage's set alone (pipeline parts): the other set VK_NULL_HANDLE, independent sets. Each set's
@@ -1928,6 +2191,60 @@ static void compile_program(void *arg) {
     atomic_fetch_add(&stat_spirv_ns, SDL_GetTicksNS() - t0);
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
+}
+
+// ---- object motion vectors: the GLSL of a program's variant that also writes its own motion vectors.
+// The vertex shader runs its body twice: first with the previous frame's constant buffers (pcbN, bindings 100 + N: the
+// same object's cbufs one frame ago - bones, object and camera matrices - kept by exec.c mv_store) into mv_pp, then as
+// the game wrote it; both clip positions go to the fragment shader (locations 30 / 31), which writes their difference
+// to colour slot k. Bodies with a return (early exit) are left alone (the game's program is drawn instead).
+static char *mv_vs_text(const char *src) {
+    const char *m = strstr(src, "void main() {"), *e = strrchr(src, '}');
+    if (!m || !e || e < m || strstr(m, "return") || strstr(src, "location = 30)") || strstr(src, "location = 31)")) return NULL;
+    const char *body = m + strlen("void main() {");
+    size_t hl = (size_t)(m - src), bl = (size_t)(e - body);
+    size_t cap = strlen(src) * 3 + 8192;
+    char *o = malloc(cap), *w = o;
+    memcpy(w, src, hl); w += hl;
+    // the previous frame's blocks next to the game's
+    for (const char *q = src; (q = strstr(q, "uniform CB")) && q < m; q++) {
+        int n = 0, sz = 0;
+        if (sscanf(q, "uniform CB%d { uvec4 cb%*d[%d]; };", &n, &sz) == 2 && n >= 3 && n < 18)
+            w += sprintf(w, "layout(std140, set = 0, binding = %d) uniform PCB%d { uvec4 pcb%d[%d]; };\n", 100 + n, n, n, sz);
+    }
+    w += sprintf(w, "layout(location = 30) out vec4 mv_c;\nlayout(location = 31) out vec4 mv_p;\n");
+    w += sprintf(w, "void main() {\n  vec4 mv_pp = vec4(0.0, 0.0, 0.0, 1.0);\n  {\n");
+    // copy 1: gl_Position -> mv_pp, cbN[ (N >= 3) -> pcbN[
+    for (const char *q = body; q < e;) {
+        if (!strncmp(q, "gl_Position", 11)) { memcpy(w, "mv_pp", 5); w += 5; q += 11; continue; }
+        if (q[0] == 'c' && q[1] == 'b' && (q == body || !(isalnum((unsigned char)q[-1]) || q[-1] == '_'))) {
+            const char *d = q + 2;
+            int n = 0;
+            while (*d >= '0' && *d <= '9') n = n * 10 + (*d++ - '0');
+            // (cbN as a whole word: cbN[...] and the dynamic-offset macro cbr(cbN, off) - the skinned characters' bones
+            // are read through it; renaming only "cbN[" left them on this frame's bones: zero motion, ghosts)
+            if (d > q + 2 && !(isalnum((unsigned char)*d) || *d == '_') && n >= 3) { *w++ = 'p'; }
+        }
+        *w++ = *q++;
+    }
+    w += sprintf(w, "  }\n  {\n");
+    memcpy(w, body, bl); w += bl;
+    w += sprintf(w, "  }\n  mv_c = gl_Position;\n  mv_p = mv_pp;\n}\n");
+    *w = 0;
+    return o;
+}
+static char *mv_fs_text(const char *src, int k) {
+    const char *m = strstr(src, "void main() {");
+    char loc[48];
+    snprintf(loc, sizeof loc, "layout(location = %d) out", k);
+    if (!m || strstr(src, "location = 30)") || strstr(src, "location = 31)") || strstr(src, loc)) return NULL;
+    size_t hl = (size_t)(m - src) + strlen("void main() {");
+    char *o = malloc(strlen(src) + 1024), *w = o;
+    memcpy(w, src, (size_t)(m - src)); w += m - src;
+    w += sprintf(w, "layout(location = 30) in vec4 mv_c;\nlayout(location = 31) in vec4 mv_p;\nlayout(location = %d) out vec4 mv_o;\n", k);
+    w += sprintf(w, "void main() {\n  mv_o = vec4((mv_c.xy / mv_c.w - mv_p.xy / mv_p.w) * 0.5, mv_p.w, 1.0);\n");
+    strcpy(w, src + hl);
+    return o;
 }
 
 static void translate_program(void *arg) {
@@ -2044,6 +2361,14 @@ static void translate_program(void *arg) {
         LOG("[shader] FS translate failed: %s\n", p->fi->error);
         atomic_store(&p->state, 2);
         return;
+    }
+    if (p->motion) {
+        char *v = mv_vs_text(p->vi->msl), *f = v ? mv_fs_text(p->fi->msl, p->motion - 1) : NULL;
+        if (!v || !f) { free(v); free(f); atomic_store(&p->state, 2); return; }
+        ShaderInfo *nv = malloc(sizeof *nv), *nf = malloc(sizeof *nf);
+        *nv = *p->vi; *nf = *p->fi;
+        nv->msl = v; nf->msl = f;
+        p->vi = nv; p->fi = nf;
     }
     p->vs_uses_vid = strstr(p->vi->msl, "gl_VertexIndex") != NULL;
     save_glsl(p->vi->msl, p->code[0], "vs");
@@ -2261,6 +2586,7 @@ static void bind_program_stages(NvnProgram *p, uint32_t mask) {
     st.program = &g_comb_prog;
 }
 
+static int g_prog_motion;  // (get_program_q: asked for the motion-vector variant, slot + 1)
 static Prog *get_program_q(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey, bool prewarm);
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) { return get_program_q(np, vkey, fkey, false); }
 static Prog *get_program_q(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey, bool prewarm) {
@@ -2296,6 +2622,7 @@ static Prog *get_program_q(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey, boo
     for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
     h = (h ^ fkey->tex_uint) * 0x100000001B3ull;
     h = (h ^ ((uint64_t)fkey->tex_sint << 32)) * 0x100000001B3ull;
+    if (g_prog_motion) h = (h ^ (0x6d76000000000000ull | (uint64_t)g_prog_motion)) * 0x100000001B3ull;
     if (!h) h = 1;
     Prog *found = map_get(&prog_tab, h);
     if (found) return found;
@@ -2307,6 +2634,7 @@ static Prog *get_program_q(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey, boo
     }
     p->vkey = *vkey;
     p->fkey = *fkey;
+    p->motion = g_prog_motion;
     p->chash[0] = by_content ? ch[0] : 0;
     p->chash[1] = by_content ? ch[1] : 0;
     if (prewarm) run_job_low(translate_program, p);
@@ -2951,7 +3279,6 @@ VkPipeline vk_prep_part(int fragment, VkShaderModule m, VkPipelineLayout layout)
 static NvnTexture *feedback_tex[4];
 static VkImageView feedback_view[4];
 static int nfeedback;
-static uint64_t g_cur_fs_hash;
 static NvnTexture *snap_tex[8];
 static bool snap_ok[8];
 static const char *snap_why[8];
@@ -3493,6 +3820,7 @@ void vk_exec_reset(void) {
     st_defaults();
 }
 
+static NvnTexture *g_ftex[8];  // (the current draw's first fragment textures: debug logs, the scene upscale hook)
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
@@ -3503,9 +3831,11 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
     sc[0] = sc[1] = 1;
     wh[0] = wh[1] = 0;
+    if (stage == 1 && i < 8) g_ftex[i] = NULL;
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
         NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
         tx = e->tex;
+        if (stage == 1 && i < 8) g_ftex[i] = e->tex;
         if (e->tex) {
             // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
             // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
@@ -3579,6 +3909,14 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             w[n].pImageInfo = &ii[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
+            w[n].pBufferInfo = &bi[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding >= 103 && b->binding < 118) {
+            int c = (int)b->binding - 103;  // (motion-vector variant: the same object's buffers last frame)
+            int t = (int)((vk_frame_counter() + 1) & 1);
+            if (g_mv_cur && g_mv_cur->size[c])
+                bi[n] = ubo_span(vk_transient_copy(g_mvs[t].arena + g_mv_cur->off[c], g_mv_cur->size[c], 256), g_mv_cur->size[c]);
+            else
+                bi[n] = cbuf_info(stage, si, c + 3, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
             bi[n] = gmem_info();
@@ -3730,6 +4068,7 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
 }
 
 static void draw_(CmdRec *r, bool indexed);
+static void xess_upscale(void);
 static Prog *g_dump_prog;  // (the last draw's program: LARECOMP_DEBUG_PASS_DRAWS writes its GLSL next to the image)
 // Sword's outline pass: a full-screen edge detect over the object-ID buffer at the game's render size (1536x864 in
 // the 1920x1080 targets), each pixel fully outlined or not; the game then scales the scene up -> stair-stepped
@@ -3762,9 +4101,15 @@ static void draw(CmdRec *r, bool indexed) {
         outline_pre(tb, orect);
         st.rt_dirty = true;  // (begun again by the draw, loading what is there)
     }
+    bool up = xu.code && target && st.program && st.program->stages[1].code_addr == xu.code;
     draw_(r, indexed);
     PROF_ADD(prof_draw);
     if (g_cur_fs_hash == OUTLINE_FS && st.program) outline_code = st.program->stages[1].code_addr;
+    if (g_cur_fs_hash == SCENE_UPSCALE_FS && st.program && !xu.code) {
+        xu.code = st.program->stages[1].code_addr;
+        up = target;
+    }
+    if (up && (xu_on() || fabsf(renderer_scene_scale() - 1.0f) > 1e-4f)) xess_upscale();
     if (soft && g_cur_fs_hash == OUTLINE_FS && target) {
         if (in_pass) { vkCmdEndRendering(vk_cmd()); in_pass = false; }
         outline_smooth(st.rt.color[0]->backend, orect);
@@ -3792,6 +4137,14 @@ static void draw(CmdRec *r, bool indexed) {
     LOG("[drawdump] %s (pass %d, %ux%u): vs %llx fs %llx (fs hash %016llx)\n", path, debug_pass_no,
         ((TexBackend *)st.rt.color[0]->backend)->width, ((TexBackend *)st.rt.color[0]->backend)->height, st.program ? (unsigned long long)st.program->stages[0].code_addr : 0ull,
         st.program ? (unsigned long long)st.program->stages[1].code_addr : 0ull, (unsigned long long)g_cur_fs_hash);
+    LOG("[drawdump]   depth @%llx: test %d write %d func %d, stencil %d\n", st.rt.depth ? (unsigned long long)st.rt.depth->addr : 0ull,
+        (int)st.ds[0], (int)st.ds[1], (int)st.ds[2], (int)st.ds[3]);
+    if (g_dump_prog && g_dump_prog->fi)
+        for (int i = 0; i < g_dump_prog->fi->ntex && i < 8; i++)
+            if (g_ftex[i]) LOG("[drawdump]   tex %d: @%llx %ux%u fmt %#x, viewport %.0f,%.0f %.0fx%.0f, verts %u, depth @%llx\n", i,
+                               (unsigned long long)g_ftex[i]->addr, g_ftex[i]->width, g_ftex[i]->height, g_ftex[i]->format,
+                               st.viewport[0][0], st.viewport[0][1], st.viewport[0][2], st.viewport[0][3], (unsigned)r->x[2],
+                               st.rt.depth ? (unsigned long long)st.rt.depth->addr : 0ull);
     renderer_save_texture_tex(st.rt.color[0]->backend, path);
     {   // LARECOMP_DEBUG_PIXELS="x,y x,y ...": the raw texels of the target at those pixels (RGBA16F / RGBA32F / 4-byte)
         static const char *px = (const char *)-1;
@@ -4627,7 +4980,7 @@ static VkPipeline ssao_pipe(const char *fs, VkFormat fmt, int blend) {
 // its blur's ping-pong; 2: a dump; 3: TAA's motion vectors (RGBA16F); 4, 5: TAA's history (RGBA16F); 6: the depth as
 // R32F (DLSS); 7: DLSS's output (RGBA16F)
 static TexBackend *fx_image(int i, uint32_t w, uint32_t h, VkFormat f) {
-    static TexBackend img[8];
+    static TexBackend img[18];
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h || d->format != f)) {
         vk_views_forget(d);
@@ -4869,6 +5222,7 @@ static float taa_env(const char *name, float def) {
 
 // Resolve this frame's scene (outside any pass): its camera motion vectors (from the depth and the two frames'
 // view-projections), then DLAA (NVIDIA, when chosen and up) or TAA against the history, back into the scene's colour.
+static void edge_inward(VkCommandBuffer cb, TexBackend *t, int32_t x0, int32_t y0, uint32_t rw, uint32_t rh);
 static void taa_run(void) {
     uint64_t fr = vk_frame_counter();
     taa.done_frame = fr;
@@ -4876,7 +5230,10 @@ static void taa_run(void) {
     TexBackend *cb_ = ao.ctex ? ao.ctex->backend : NULL;
     static int nolog;
     if (!d || !d->image || !(d->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || d->samples > 1 || !cb_ || !cb_->image || !ao.cview) return;
-    if (taa.cam_frame != fr || ao.proj_frame != fr) {
+    // (XeSS upscaling goes on without a camera - some battle shots: XeSS skipped there showed the game's bilinear
+    // upscale, soft frames among sharp ones; it runs with no motion instead)
+    bool nocam = taa.cam_frame != fr || ao.proj_frame != fr;
+    if (nocam && !xu_on()) {
         if (nolog < 5) nolog++, LOG("[taa] frame %llu: no camera found in the scene's %u opaque draws: not resolved\n",
                                     (unsigned long long)fr, ao.opaque);
         return;
@@ -4896,7 +5253,7 @@ static void taa_run(void) {
     if (vw < 16 || vh < 16) vx = vy = 0, vw = (float)w, vh = (float)h;
     // the motion vectors: previous view-projection x the inverse of this one (identity without a previous frame)
     double m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}, inv[16];
-    bool moved = taa.prev_ok && mat4_inv(taa.vp, inv);
+    bool moved = !nocam && taa.prev_ok && mat4_inv(taa.vp, inv);
     if (moved)
         for (int r = 0; r < 4; r++)
             for (int c = 0; c < 4; c++) {
@@ -4913,19 +5270,44 @@ static void taa_run(void) {
     const VkFormat F16 = VK_FORMAT_R16G16B16A16_SFLOAT;
     TexBackend *mv = fx_image(3, w, h, F16);
     ssao_pass(cb, ssao_pipe("taa_mv.frag", F16, 0), &dv, 1, ssao_view(mv), w, h, pm, 96, 0, false);
+    if (g_mv_frame == fr && g_mv_img && !xu_on()) {  // (the objects' own vectors where they wrote them)
+        TexBackend *mm = fx_image(15, w, h, F16);
+        float pa[4] = {vw, vh, mv_ysign(), 0};
+        VkImageView iv2[2] = {ssao_view(mv), ssao_view(g_mv_img)};
+        ssao_pass(cb, ssao_pipe("mv_merge.frag", F16, 0), iv2, 2, ssao_view(mm), w, h, pa, 16, 0, false);
+        mv = mm;
+    }
     bool full = vx == 0 && vy == 0 && (uint32_t)vw == w && (uint32_t)vh == h;
     // DLAA: the scene's rectangle from the top-left (all of the target, or Sword's dynamic resolution's part of it)
     bool corner = vx == 0 && vy == 0 && vw == floorf(vw) && vh == floorf(vh);
     (void)full;
-    int mode = g_settings.antialias == AA_DLAA && dlss_available() && corner ? 2 : 1;
+    int mode = xu_on() && vx == 0 && vy == 0 ? 4
+             : g_settings.antialias == AA_DLAA && dlss_available() && corner ? 2
+             : g_settings.antialias == AA_XESS && xess_available() && corner ? 3 : 1;
     static uint64_t taa_prev_frame;
     static int taa_prev_mode;
     bool reset = !moved || taa.hist_frame + 1 != fr || taa.hist_w != w || taa.hist_h != h || taa.hist_mode != mode ||
                  memcmp(taa.hist_vp, (float[4]){vx, vy, vw, vh}, sizeof taa.hist_vp) != 0;
     float jx = taa.jit_used == fr ? taa.jx : 0, jy = taa.jit_used == fr ? taa.jy : 0;
     static float sharp_k = -1;
-    if (sharp_k < 0) sharp_k = taa_env("LARECOMP_TAA_SHARPEN", 1.0f);
+    if (sharp_k < 0) sharp_k = taa_env("LARECOMP_TAA_SHARPEN", 1.75f);  // (TAA v2: 1.75 closest to a 4K reference, 2026-11-23)
     TexBackend *res = NULL;
+    if (mode == 4) {  // XeSS upscaling: no resolve here - the vectors and the depth wait for the game's upscale draw
+        TexBackend *dz = fx_image(6, w, h, VK_FORMAT_R32_SFLOAT);
+        float pz[16] = {0};
+        ssao_pass(cb, ssao_pipe("depth_r32.frag", VK_FORMAT_R32_SFLOAT, 0), &dv, 1, ssao_view(dz), w, h, pz, 64, 0, false);
+        // (no camera: the history is kept across such frames - only a size change or a gap resets it)
+        xu.reset = nocam ? xu.prep_frame + 1 != fr || xu.w != w || xu.h != h : reset;
+        xu.mv = mv, xu.dz = dz, xu.w = w, xu.h = h, xu.rw = (uint32_t)floorf(vw + 0.01f), xu.rh = (uint32_t)floorf(vh + 0.01f);  // (k x 864 = 1079.99998)
+        xu.jx = jx, xu.jy = jy, xu.prep_frame = fr;
+        taa.hist_frame = fr, taa.hist_w = w, taa.hist_h = h, taa.hist_mode = mode;
+        taa.hist_vp[0] = vx, taa.hist_vp[1] = vy, taa.hist_vp[2] = vw, taa.hist_vp[3] = vh;
+        taa.ok_frame = fr;
+        static int logged4;
+        if (!logged4) logged4 = 1, LOG("[taa] XeSS upscaling: scene %ux%u, its part %.0fx%.0f, jitter %.3f %.3f px\n", w, h, vw, vh, jx, jy);
+        ao.busy = false;
+        return;
+    }
     if (mode == 2) {  // DLAA: the scene's own image, the depth as R32F, the vectors in pixels (previous - current)
         uint32_t rw = (uint32_t)vw, rh = (uint32_t)vh;
         TexBackend *dz = fx_image(6, w, h, VK_FORMAT_R32_SFLOAT), *out = fx_image(7, rw, rh, F16);
@@ -4939,18 +5321,37 @@ static void taa_run(void) {
         else mode = 1;  // (DLSS failed: TAA from now on)
         cb = vk_cmd();
     }
+    if (mode == 3) {  // XeSS (xess.c): the same inputs as DLAA, run at 1x
+        uint32_t rw = (uint32_t)vw, rh = (uint32_t)vh;
+        TexBackend *dz = fx_image(6, w, h, VK_FORMAT_R32_SFLOAT), *out = fx_image(7, rw, rh, F16);
+        float pz[16] = {0};
+        ssao_pass(cb, ssao_pipe("depth_r32.frag", VK_FORMAT_R32_SFLOAT, 0), &dv, 1, ssao_view(dz), w, h, pz, 64, 0, false);
+        DlssInput in = {.color = cb_->image, .depth = dz->image, .mv = mv->image, .output = out->image, .color_fmt = cb_->format,
+                        .rw = rw, .rh = rh, .ow = rw, .oh = rh, .iw = w, .ih = h, .jx = jx, .jy = jy,
+                        .mv_scale_x = -(float)w, .mv_scale_y = -(float)h,
+                        .reset = reset};
+        if (g_gpuprof_frame) gp_mark(cb, "ours: XeSS");
+        if (xess_dispatch(cb, &in)) res = out;
+        else mode = 1;  // (XeSS failed: TAA from now on)
+        cb = vk_cmd();
+    }
     if (mode == 1) {  // TAA: this frame against the history (ping-pong 4 / 5), the history by Catmull-Rom (linear)
         TexBackend *hc = fx_image(4 + (int)(fr & 1), w, h, F16), *hp = fx_image(4 + (int)((fr + 1) & 1), w, h, F16);
-        static float weight = -1;
+        static float weight = -1, minblend = -1;
+        static int old_taa = -1;
         if (weight < 0) weight = taa_env("LARECOMP_TAA_HISTORY", 0.9f);
-        float pt[16] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], reset ? 1.0f : 0.0f, weight, mo, 0,
-                        vx / (float)w, vy / (float)h, (vx + vw) / (float)w, (vy + vh) / (float)h};
+        if (minblend < 0) minblend = taa_env("LARECOMP_TAA_MINBLEND", 0.08f);  // (TAA v2: the still pixel's new-frame share)
+        if (old_taa < 0) old_taa = getenv("LARECOMP_TAA_OLD") != NULL;
+        static float rawmix = -1;  // (TAA v2: the raw jittered sample's share of the new frame - LARECOMP_TAA_RAW)
+        if (rawmix < 0) rawmix = taa_env("LARECOMP_TAA_RAW", 0.0f);
+        float pt[20] = {ao.proj[0], ao.proj[1], ao.proj[2], ao.proj[3], reset ? 1.0f : 0.0f, old_taa ? weight : minblend, mo, 0,
+                        vx / (float)w, vy / (float)h, (vx + vw) / (float)w, (vy + vh) / (float)h, jx, jy, rawmix, 0};
         VkImageView src[4] = {ao.cview, ssao_view(hp), ssao_view(mv), dv};
-        ssao_pass(cb, ssao_pipe("taa.frag", F16, 0), src, 4, ssao_view(hc), w, h, pt, 64, 2, false);
+        ssao_pass(cb, ssao_pipe(old_taa ? "taa_old.frag" : "taa.frag", F16, 0), src, 4, ssao_view(hc), w, h, pt, old_taa ? 64 : 80, 2, false);
         res = hc;
     }
     // back into the scene, sharpened (TAA_SHARPNESS: the history's blur; DLAA sharpens nothing itself)
-    float pk[8] = {0, 0, 0, 0, 1.0f / (float)w, 1.0f / (float)h, g_settings.taa_sharpness * (mode == 2 ? 0.5f : 0.8f) * sharp_k, 0};
+    float pk[8] = {0, 0, 0, 0, 1.0f / (float)w, 1.0f / (float)h, g_settings.taa_sharpness * (mode >= 2 ? 0.5f : 0.8f) * sharp_k, 0};
     VkImageView ri[1] = {ssao_view(res)};
     ssao_pass(cb, ssao_pipe("taa_copy.frag", ao.cfmt, 0), ri, 1, ao.cview, w, h, pk, 32, 0, false);
     taa.hist_frame = fr, taa.hist_w = w, taa.hist_h = h, taa.hist_mode = mode;
@@ -4960,7 +5361,7 @@ static void taa_run(void) {
     if (logged_mode != mode) {
         logged_mode = mode;
         LOG("[taa] %s: scene %ux%u (format %d), viewport %.0f,%.0f %.0fx%.0f, history %s, jitter %.3f %.3f px, %u opaque draws\n",
-            mode == 2 ? "DLAA" : "TAA", w, h, (int)cb_->format, vx, vy, vw, vh, reset ? "reset" : "kept", jx, jy, ao.opaque);
+            mode == 3 ? "XeSS" : mode == 2 ? "DLAA" : "TAA", w, h, (int)cb_->format, vx, vy, vw, vh, reset ? "reset" : "kept", jx, jy, ao.opaque);
     }
     {   // every 600 frames: how many were resolved, with their history, jittered (the reasons for a reset)
         static uint32_t n, kept, jit, why[4];
@@ -4974,6 +5375,234 @@ static void taa_run(void) {
         }
     }
     ao.busy = false;
+}
+
+// The scene's edge copied outwards (player 2026-11-23: "a thin light blue line at the top, shaking", XeSS / TAA only):
+// outdoors Sword draws its scene into 80% of the target and the rows / columns just outside it keep the clear colour (a
+// light blue). The jitter moves the scene by up to half a pixel, so the resolve rebuilt the edge row partly from that
+// band. Its last row and column are copied over the next 4 rows / columns (GENERAL layout, non-overlapping copies of one
+// image) before XeSS reads it. LARECOMP_NO_EDGE_FILL=1: off.
+static void edge_extend(VkCommandBuffer cb, TexBackend *t, uint32_t rw, uint32_t rh) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_EDGE_FILL") != NULL;
+    if (off || !t || !t->image || !rw || !rh || rw > t->width || rh > t->height || (rw == t->width && rh == t->height)) return;
+    VkImageAspectFlags asp = t->aspect ? t->aspect & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+    if (!asp) asp = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageCopy rg[8];
+    int n = 0;
+    uint32_t gx = t->width - rw < 4 ? t->width - rw : 4, gy = t->height - rh < 4 ? t->height - rh : 4;
+    for (uint32_t i = 0; i < gx; i++)  // (the last column, rows 0 .. rh - 1)
+        rg[n++] = (VkImageCopy){{asp, 0, 0, 1}, {(int32_t)rw - 1, 0, 0}, {asp, 0, 0, 1}, {(int32_t)(rw + i), 0, 0}, {1, rh, 1}};
+    vk_full_barrier(cb);
+    if (n) vkCmdCopyImage(cb, t->image, VK_IMAGE_LAYOUT_GENERAL, t->image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)n, rg);
+    n = 0;
+    for (uint32_t i = 0; i < gy; i++)  // (then the last row, with the filled columns)
+        rg[n++] = (VkImageCopy){{asp, 0, 0, 1}, {0, (int32_t)rh - 1, 0}, {asp, 0, 0, 1}, {0, (int32_t)(rh + i), 0}, {rw + gx, 1, 1}};
+    vk_full_barrier(cb);
+    if (n) vkCmdCopyImage(cb, t->image, VK_IMAGE_LAYOUT_GENERAL, t->image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)n, rg);
+    vk_full_barrier(cb);
+}
+
+// The ROOT of the blue line (2026-11-23): the jitter is a viewport offset of up to half a pixel, so on some frames the
+// pixel centres of the scene rectangle's first (or last) row / column lie outside the viewport: that row is never
+// rasterised and keeps the scene pass's clear colour (sky blue) - row 0 = the top of the screen. The row / column next to
+// each edge is copied over it (colour and depth, before the vectors are derived) whenever the frame is jittered.
+// LARECOMP_NO_EDGE_FIX=1: off.
+static void edge_inward(VkCommandBuffer cb, TexBackend *t, int32_t x0, int32_t y0, uint32_t rw, uint32_t rh) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_EDGE_FIX") != NULL;
+    if (off || !t || !t->image || rw < 4 || rh < 4 || x0 < 0 || y0 < 0 || (uint32_t)x0 + rw > t->width || (uint32_t)y0 + rh > t->height) return;
+    VkImageAspectFlags asp = t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    int32_t x1 = x0 + (int32_t)rw - 1, y1 = y0 + (int32_t)rh - 1;
+    VkImageCopy rows[2] = {{{asp, 0, 0, 1}, {x0, y0 + 1, 0}, {asp, 0, 0, 1}, {x0, y0, 0}, {rw, 1, 1}},
+                           {{asp, 0, 0, 1}, {x0, y1 - 1, 0}, {asp, 0, 0, 1}, {x0, y1, 0}, {rw, 1, 1}}};
+    VkImageCopy cols[2] = {{{asp, 0, 0, 1}, {x0 + 1, y0, 0}, {asp, 0, 0, 1}, {x0, y0, 0}, {1, rh, 1}},
+                           {{asp, 0, 0, 1}, {x1 - 1, y0, 0}, {asp, 0, 0, 1}, {x1, y0, 0}, {1, rh, 1}}};
+    vk_full_barrier(cb);
+    vkCmdCopyImage(cb, t->image, VK_IMAGE_LAYOUT_GENERAL, t->image, VK_IMAGE_LAYOUT_GENERAL, 2, rows);
+    vk_full_barrier(cb);
+    vkCmdCopyImage(cb, t->image, VK_IMAGE_LAYOUT_GENERAL, t->image, VK_IMAGE_LAYOUT_GENERAL, 2, cols);
+    vk_full_barrier(cb);
+}
+
+// raw bytes of an sRGB image (XeSS reads and writes the tone-mapped image as stored, gamma-encoded)
+static VkFormat unorm_twin(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    default: return f;
+    }
+}
+
+// XeSS upscaling, right after the game's scene upscale draw (draw(): SCENE_UPSCALE_FS): its target and depth become
+// output targets, the scene's scale follows the ratio, and XeSS's output replaces the colour the game's bilinear
+// upscale wrote (the depth it copied stays: the HUD's 3D bits test against it).
+static void xess_upscale(void) {
+    uint64_t fr = vk_frame_counter();
+    NvnTexture *src = g_ftex[0], *dst = st.rt.color[0];
+    if (!src || !dst || !src->backend || !dst->backend) return;
+    xu.seen_frame = fr;
+    bool newly = vk_tex_mark_output(dst);
+    newly |= vk_tex_mark_output(st.rt.depth);
+    if (!xu_on()) return;
+    // the scene's scale: its part of the target (the game's own fraction: this draw's cb3[0].x, 0.8 in the open, 1
+    // indoors) at the output's rows / Intel's ratio
+    float f = 1.0f;
+    if (st.ubuf[1][0].addr && st.ubuf[1][0].size >= 4) {
+        float c = *(const float *)(uintptr_t)st.ubuf[1][0].addr;
+        if (c >= 0.25f && c <= 1.0f) f = c;
+    }
+    float gx, gy;
+    renderer_get_scale(&gx, &gy);
+    xu_f = f;
+    // (Native full size: the scene's part at the output's rows - outdoors the scene's images grow by 1 / 0.8)
+    float out_rows = (float)dst->height * gy,
+          in_rows = xu_full() ? out_rows : xu_native() ? out_rows * f : roundf(out_rows / xess_upscale_ratio());
+    float k = in_rows / ((float)dst->height * f * gy);
+    if (k > (xu_full() ? 1.0f / f : 1.0f)) k = xu_full() ? 1.0f / f : 1.0f;
+    if (fabsf(k - renderer_scene_scale()) > 1e-4f) {  // (the scene's images are made again from the next frame)
+        LOG("[xess] upscaling: the game draws %.0f%% of its target, output %.0f rows -> scene scale %.3f (%.0f rows)\n",
+            f * 100.0f, out_rows, k, in_rows);
+        renderer_set_scene_scale(k);
+        return;
+    }
+    TexBackend *sb = src->backend, *db = dst->backend;
+    if (xu.dump_at == fr && xu.id[0] && xu.id[1]) {
+        xu.dump_at = 0;
+        if (in_pass) { vkCmdEndRendering(vk_cmd()); in_pass = false; st.rt_dirty = true; }
+        renderer_save_texture_tex(xu.id[0]->backend, "build/xess_id0.png");
+        renderer_save_texture_tex(xu.id[1]->backend, "build/xess_id1.png");
+        renderer_save_texture_tex(sb, "build/xess_in.png");
+    }
+    static uint32_t calls, skips, why[4], nscene;
+    if (++calls >= 600) {
+        LOG("[xess] upscaling: %u of the last 600 upscale draws done by XeSS (%llu in all, %llu failed; skipped: target %u, "
+            "no vectors this frame %u (resolve not reached %u, no scene found %u), sizes %u)\n", 600 - skips, (unsigned long long)xu.runs,
+            (unsigned long long)xu.fails, why[0], why[1], why[3], nscene, why[2]);
+        nscene = 0;
+        calls = skips = 0, memset(why, 0, sizeof why);
+    }
+    skips++;
+    if (newly || !db->out || sb->out || fabsf(db->sx - gx) > 1e-6f || fabsf(db->sy - gy) > 1e-6f) { why[0]++; return; }
+    if (xu.prep_frame != fr && taa.done_frame != fr && ao.frame == fr && ao.dtex && ao.ctex && ao.cview && !ao.busy) {
+        // the resolve's place was never reached: a scene of fewer than 16 opaque draws (battle close-ups) - its vectors
+        // and depth are made now, the scene being complete (they are only read, nothing is written back)
+        if (in_pass) { vkCmdEndRendering(vk_cmd()); in_pass = false; }
+        taa_run();
+        st.rt_dirty = true;
+        sb = src->backend, db = dst->backend;
+    }
+    if (xu.prep_frame != fr || !xu.mv || !xu.dz) {
+        why[1]++;
+        if (taa.done_frame != fr) why[3]++;
+        if (!ao.dtex || ao.opaque < 16) nscene++;
+        return;
+    }  // (taa_run did not run: no camera found)
+    if (sb->width != xu.w || sb->height != xu.h) { why[2]++; return; }
+    if (in_pass) { vkCmdEndRendering(vk_cmd()); in_pass = false; }
+    VkCommandBuffer cb = vk_cmd();
+    if (g_gpuprof_frame) gp_mark(cb, "ours: XeSS upscale");
+    TexBackend *out = fx_image(8, db->width, db->height, VK_FORMAT_R16G16B16A16_SFLOAT);
+    // the responsive mask: the characters of this frame (slot 10 / 11 by frame) or the previous one, x the strength
+    // (LARECOMP_XESS_MASK=<0..1>, default 0: the objects' own vectors cover the characters now; 0.75 was the old default)
+    static float mstr = -1;
+    if (mstr < 0) mstr = getenv("LARECOMP_XESS_MASK") ? (float)atof(getenv("LARECOMP_XESS_MASK")) : 0.0f;  // (0 since the skinned characters got their own vectors, 2026-11-23)
+    VkImage mask_img = VK_NULL_HANDLE;
+    if (mstr > 0 && xu.id[1] && xu.id_frame == fr && xu.id[1]->backend) {
+        TexBackend *idb = xu.id[1]->backend;
+        if (idb->width == sb->width && idb->height == sb->height) {
+            TexBackend *cn = fx_image(10 + (int)(fr & 1), sb->width, sb->height, VK_FORMAT_R8_UNORM);
+            TexBackend *cp = fx_image(10 + (int)((fr + 1) & 1), sb->width, sb->height, VK_FORMAT_R8_UNORM);
+            TexBackend *mk = fx_image(12, sb->width, sb->height, VK_FORMAT_R8_UNORM);
+            TexBackend *ap = fx_image(13, sb->width, sb->height, VK_FORMAT_R8G8B8A8_UNORM);  // (the previous frame's albedo)
+            float z[8] = {0};
+            bool fresh = xu.mask_frame + 1 != fr;
+            if (fresh) {  // (no previous frame's: this one's albedo for both, nothing moved)
+                VkImageView iv0[1] = {ssao_view(idb)};
+                ssao_pass(cb, ssao_pipe("taa_copy.frag", VK_FORMAT_R8G8B8A8_UNORM, 0), iv0, 1, ssao_view(ap), sb->width, sb->height, z, 32, 0, false);
+            }
+            static float thr = -1;  // (LARECOMP_XESS_MOVE=<0..1>: how far a colour must change to count as moving)
+            if (thr < 0) thr = getenv("LARECOMP_XESS_MOVE") ? (float)atof(getenv("LARECOMP_XESS_MOVE")) : 0.08f;
+            float pc_[4] = {thr, 0, 0, 0};
+            VkImageView iv[3] = {ssao_view(idb), ssao_view(ap), ssao_view(xu.mv)};
+            ssao_pass(cb, ssao_pipe("xess_char.frag", VK_FORMAT_R8_UNORM, 0), iv, 3, ssao_view(cn), sb->width, sb->height, pc_, 16, 0, false);
+            if (fresh) {
+                float zz[4] = {0, 0, 0, 0};  // (cleared: nothing moved before)
+                ssao_pass(cb, ssao_pipe("xess_mask.frag", VK_FORMAT_R8_UNORM, 0), iv, 2, ssao_view(cp), sb->width, sb->height, zz, 16, 0, false);
+            }
+            {   // this frame's albedo, for the next frame
+                VkImageView iv1[1] = {ssao_view(idb)};
+                ssao_pass(cb, ssao_pipe("taa_copy.frag", VK_FORMAT_R8G8B8A8_UNORM, 0), iv1, 1, ssao_view(ap), sb->width, sb->height, z, 32, 0, false);
+            }
+            float pm[4] = {mstr, 0, 0, 0};
+            VkImageView mv2[2] = {ssao_view(cn), ssao_view(cp)};
+            ssao_pass(cb, ssao_pipe("xess_mask.frag", VK_FORMAT_R8_UNORM, 0), mv2, 2, ssao_view(mk), sb->width, sb->height, pm, 16, 0, false);
+            xu.mask_frame = fr;
+            mask_img = mk->image;
+        }
+    }
+    if (mstr > 0 && !mask_img) {
+        // no characters' target this frame (title screen, menus): an empty mask - never none, or XeSS is made again with
+        // other flags (a device wait) at each switch; the title intro lost the device that way
+        TexBackend *mk = fx_image(12, sb->width, sb->height, VK_FORMAT_R8_UNORM);
+        TexBackend *c0 = fx_image(10, sb->width, sb->height, VK_FORMAT_R8_UNORM), *c1 = fx_image(11, sb->width, sb->height, VK_FORMAT_R8_UNORM);
+        float zz[4] = {0, 0, 0, 0};
+        VkImageView mv2[2] = {ssao_view(c0), ssao_view(c1)};
+        ssao_pass(cb, ssao_pipe("xess_mask.frag", VK_FORMAT_R8_UNORM, 0), mv2, 2, ssao_view(mk), sb->width, sb->height, zz, 16, 0, false);
+        xu.mask_frame = 0;  // (the next frame with characters starts fresh)
+        mask_img = mk->image;
+    }
+    VkImage mv_use = xu.mv->image;
+    if (g_mv_frame == fr && g_mv_img) {  // (object motion vectors: the objects' own where they wrote them)
+        TexBackend *mm = fx_image(15, xu.w, xu.h, VK_FORMAT_R16G16B16A16_SFLOAT);
+        float pa[4] = {(float)xu.rw, (float)xu.rh, mv_ysign(), 0};
+        VkImageView iv2[2] = {ssao_view(xu.mv), ssao_view(g_mv_img)};
+        ssao_pass(cb, ssao_pipe("mv_merge.frag", VK_FORMAT_R16G16B16A16_SFLOAT, 0), iv2, 2, ssao_view(mm), xu.w, xu.h, pa, 16, 0, false);
+        mv_use = mm->image;
+        static long dump_at = -2;  // (research) LARECOMP_OBJMV_DUMP=<present>: build/mv_cam.png, mv_obj.png, mv_merged.png
+        if (dump_at == -2) dump_at = getenv("LARECOMP_OBJMV_DUMP") ? atol(getenv("LARECOMP_OBJMV_DUMP")) : -1;
+        if (dump_at >= 0 && (long)renderer_present_count() >= dump_at) {
+            dump_at = -1;
+            const char *names[3] = {"build/mv_cam.png", "build/mv_obj.png", "build/mv_merged.png"};
+            TexBackend *srcs[3] = {xu.mv, g_mv_img, mm};
+            float sc[3] = {50.0f, 50.0f * 0.5f, 50.0f};  // (obj: in viewport uv x 0.5... shown at the same scale)
+            for (int i = 0; i < 3; i++) {
+                TexBackend *vz = fx_image(16, srcs[i]->width, srcs[i]->height, VK_FORMAT_R8G8B8A8_UNORM);
+                float pv[4] = {i == 1 ? 50.0f : 50.0f, 0, 0, 0};
+                (void)sc;
+                VkImageView one = ssao_view(srcs[i]);
+                ssao_pass(vk_cmd(), ssao_pipe("mv_viz.frag", VK_FORMAT_R8G8B8A8_UNORM, 0), &one, 1, ssao_view(vz), vz->width, vz->height, pv, 16, 0, false);
+                renderer_save_texture_tex(vz, names[i]);
+            }
+        }
+    }
+    edge_extend(cb, sb, xu.rw, xu.rh);
+    edge_extend(cb, xu.dz, xu.rw, xu.rh);
+    edge_extend(cb, mv_use == xu.mv->image ? xu.mv : fx_image(15, xu.w, xu.h, VK_FORMAT_R16G16B16A16_SFLOAT), xu.rw, xu.rh);
+    DlssInput in = {.color = sb->image, .depth = xu.dz->image, .mv = mv_use, .output = out->image, .mask = mask_img,
+                    .color_fmt = unorm_twin(sb->format), .rw = xu.rw, .rh = xu.rh, .ow = db->width, .oh = db->height,
+                    .iw = sb->width, .ih = sb->height, .jx = xu.jx, .jy = xu.jy,
+                    .mv_scale_x = -(float)xu.w, .mv_scale_y = -(float)xu.h, .reset = xu.reset,
+                    .xq = xu_full() ? XESS_Q_FULL : xu_native() ? XESS_Q_ULTRA_PLUS : g_settings.xess_quality, .ldr = true};
+    if (xess_dispatch(cb, &in)) {
+        skips--;
+        cb = vk_cmd();
+        static float sharp = -1;
+        if (sharp < 0) sharp = getenv("LARECOMP_XESS_SHARPEN") ? (float)atof(getenv("LARECOMP_XESS_SHARPEN")) : 1.0f;  // (1: measured sharper on a Postwick walk, 0.5 visibly soft next to TAA)
+        float pk[8] = {0, 0, 0, 0, 1.0f / (float)db->width, 1.0f / (float)db->height, g_settings.taa_sharpness * sharp, 0};
+        VkImageView ri[1] = {ssao_view(out)};
+        static const VkComponentMapping id = {0};
+        VkFormat wf = unorm_twin(db->format);
+        VkImageView dv = vk_image_view(db, VK_IMAGE_VIEW_TYPE_2D, wf, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+        ssao_pass(cb, ssao_pipe("taa_copy.frag", wf, 0), ri, 1, dv, db->width, db->height, pk, 32, 0, false);
+        if (!xu.runs++)
+            LOG("[xess] upscaling: %ux%u of the scene's %ux%u (format %d) -> %ux%u (format %d), the game's part %.0f%%\n",
+                xu.rw, xu.rh, sb->width, sb->height, (int)sb->format, db->width, db->height, (int)db->format, f * 100.0f);
+    } else {
+        xu.fails++;
+    }
+    st.rt_dirty = true;
 }
 
 // draw_, right after begin_pass: counts the scene's opaque draws (and finds the projection with them); at the first
@@ -5084,6 +5713,28 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
     }
+    {   // LARECOMP_WATCH_VDRAW=<present>:<word>:<min>:<max> (research, Windows): at the first draw from that present whose
+        // vertex cbuf slot 0 word lies in [min, max], watch who writes that word (UI panes: word 19 = x offset)
+        static int vd_state = -1;
+        static long vd_from, vd_word;
+        static float vd_min, vd_max;
+        if (vd_state < 0) {
+            const char *e = getenv("LARECOMP_WATCH_VDRAW");
+            vd_state = e && sscanf(e, "%ld:%ld:%f:%f", &vd_from, &vd_word, &vd_min, &vd_max) == 4 ? 0 : 1;
+        }
+        if (!vd_state && (long)renderer_present_count() >= vd_from && st.ubuf[0][0].addr && vd_word >= 0 &&
+            (uint64_t)vd_word * 4 + 4 <= st.ubuf[0][0].size) {
+            float v = ((const float *)(uintptr_t)st.ubuf[0][0].addr)[vd_word];
+            if (v >= vd_min && v <= vd_max) {
+                vd_state = 1;
+                extern void memwatch_add(uint64_t addr);
+                uint64_t a = st.ubuf[0][0].addr + 4 * (uint64_t)vd_word;
+                LOG("[watchvdraw] present %llu: watching vcb0 word %ld (%g) at %llx\n", (unsigned long long)renderer_present_count(),
+                    vd_word, (double)v, (unsigned long long)a);
+                memwatch_add(a);
+            }
+        }
+    }
     {   // LARECOMP_WATCH_DRAW=<present>:<vertex count>:<fragment cb>:<word> (research, Windows): at the first draw of that
         // many vertices from that present on, watch who writes that word of its fragment constant buffer (hle/memwatch.c)
         static int wd_state = -1;
@@ -5101,6 +5752,22 @@ static void draw_(CmdRec *r, bool indexed) {
             LOG("[watchdraw] present %llu: watching fcb%ld word %ld at %llx\n", (unsigned long long)renderer_present_count(), wd_cb, wd_word,
                 (unsigned long long)a);
             memwatch_add(a);
+        }
+    }
+    {   // (research) LARECOMP_LOG_FSDRAW=<fs hash>: every draw with that fragment shader, its vertex / fragment cbuf words
+        static int ld_state = -1;
+        static unsigned long long ld_fs;
+        if (ld_state < 0) ld_state = getenv("LARECOMP_LOG_FSDRAW") && sscanf(getenv("LARECOMP_LOG_FSDRAW"), "%llx", &ld_fs) == 1;
+        if (ld_state && g_cur_fs_hash == ld_fs) {
+            for (int s = 0; s < 2; s++)
+                for (int c = 0; c < 18; c++) {
+                    const ShaderInfo *si = s ? pr->fi : pr->vi;
+                    if (!((si->cbuf_mask >> (c + 3)) & 1) || !st.ubuf[s][c].addr) continue;
+                    const float *u = (const float *)(uintptr_t)st.ubuf[s][c].addr;
+                    LOG("[fsdraw] p%llu %ccb%d:", (unsigned long long)renderer_present_count(), s ? 'f' : 'v', c);
+                    for (int k = 0; k < 48 && k * 4 < (int)st.ubuf[s][c].size; k++) LOG(" %.5g", u[k]);
+                    LOG("\n");
+                }
         }
     }
     if (g_debug_frame) debug_draw(pr, r, indexed);
@@ -5136,11 +5803,38 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_pre += prof_tk_ - prof_tp_;
     // ---- pipeline
     PipeKey k;
+    g_mv_cur = NULL;
+    Prog *mvp = NULL;
+    if (g_mv_slot >= 0 && native && cls == 2 && st.ds[0] && st.ds[1] && !(st.color_state[0] & 1)) {  // (opaque, writes depth)
+        uint64_t key = mv_store(r, indexed, pr->vi);
+        const MvSnap *ps = mv_prev(key);
+        if (++stat_mv_draws % 20000 == 0)
+            LOG("[objmv] of the last 20000 opaque scene draws: own vectors %llu, not drawn last frame %llu, variant being built %llu\n",
+                (unsigned long long)stat_mv_obj, (unsigned long long)stat_mv_noprev, (unsigned long long)stat_mv_building),
+            stat_mv_obj = stat_mv_noprev = stat_mv_building = 0;
+        if (!ps) stat_mv_noprev++;
+        else {
+            g_prog_motion = g_mv_slot + 1;
+            Prog *mp = get_program_q(st.program, &vkey, &fkey, true);
+            g_prog_motion = 0;
+            if (mp && atomic_load(&mp->state) == 1) {
+                PipeKey mk;
+                pipe_key_fill(&mk, mp, cls, pass_ncolor, pass_color, pass_depth, pass_stencil, pass_samples);
+                mk.write_mask[g_mv_slot] = 0xF;
+                bool mc;
+                Pipe *mpp = pipe_get(&mk, false, &mc);
+                if (atomic_load(&mpp->state) == 1 || atomic_load(&mpp->fstate) == 1) { mvp = mp; g_mv_cur = ps; stat_mv_obj++; }
+                else stat_mv_building++;
+            } else stat_mv_building++;
+        }
+    }
+    if (mvp) pr = mvp;
     pipe_key_fill(&k, pr, cls, pass_ncolor, pass_color, pass_depth, pass_stencil, pass_samples);
+    if (mvp) k.write_mask[g_mv_slot] = 0xF;
     stat_alpha_func[st.color_state[2] & 15]++;
     bool created;
     Pipe *pp = pipe_get(&k, false, &created);
-    if (created || (!pp->drawn && !pp->prewarmed)) recipe_record(pr, &k);  // (a prefetched pipe: first drawn here)
+    if (!mvp && (created || (!pp->drawn && !pp->prewarmed))) recipe_record(pr, &k);  // (a prefetched pipe: first drawn here)
     else if (pp->prewarmed && !pp->drawn) stat_recipe_adopted++;
     pp->drawn = true;
     if (atomic_load(&pp->state) == 0) pf_rest_of_list();  // (about to wait: find the rest of the list's needs first)
@@ -5485,7 +6179,9 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         (unsigned long long)(indexed ? r->x[6] : r->x[4]), (unsigned long long)r->x[0], (unsigned long long)r->x[2],
         (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
+    for (int i = 0; i < st.rt.ncolor; i++)
+        if (st.rt.color[i]) LOG(" %ux%u/f%#x@%llx", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format,
+                                (unsigned long long)st.rt.color[i]->addr);
     if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
@@ -6170,7 +6866,10 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     // the depth, which is not anti-aliased - the far edges' stairs come back there; SMAA on the final image smooths them
     static int taa_smaa = -1;
     if (taa_smaa < 0) taa_smaa = getenv("LARECOMP_TAA_SMAA") ? atoi(getenv("LARECOMP_TAA_SMAA")) : 1;
-    bool smaa = g_settings.antialias == AA_SMAA || (taa_smaa && taa_wanted() && taa.ok_frame + 2 >= vk_frame_counter());
+    // (not after XeSS: measured on the busy save 2026-11-23, no gain - accuracy 27.48 with vs 27.51 dB without; after TAA
+    // +1 dB. The settings file's old "smaa = 1" line made the player think both were on.)
+    bool smaa = g_settings.antialias == AA_SMAA || (taa_smaa && taa_wanted() && g_settings.antialias != AA_XESS &&
+                                                     taa.ok_frame + 2 >= vk_frame_counter());
     uint32_t ow = (uint32_t)lround(ow_d), oh = (uint32_t)lround(oh_d);
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;

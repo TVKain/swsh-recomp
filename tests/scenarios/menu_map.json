@@ -1,0 +1,11 @@
+{
+ "description": "X menu -> Town Map, hold the stick right: map cursor speed 30 vs 60 (research, MENU60)",
+ "save": "build/scenario-saves/user_grass",
+ "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8,1700:X:4,1730:RIGHT:4,1745:RIGHT:4,1760:RIGHT:4,1780:A:4,1900:STICK_RIGHT:40",
+ "exit_at": 1960,
+ "measure": [
+  1880,
+  1960
+ ],
+ "shots": [1790, 1820, 1850, 1880, 1895, 1900, 1904, 1908, 1912, 1916, 1920, 1924, 1928, 1932, 1936, 1940, 1944, 1948, 1952]
+}

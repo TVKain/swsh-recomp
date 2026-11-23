@@ -73,13 +73,15 @@ GAMELIB_LDFLAGS := -shared -fuse-ld=lld  # (the runtime functions it calls: the 
 GAMELIB_SHARED := -shared
 else
 EXE      := $(B)/$(EXE_NAME).exe
+PLAY_EXE := $(B)/$(EXE_NAME)-Play.exe
 DEPINC   := $(if $(DEPS),-I$(DEPS)/include)
 OSFLAGS  := -D_FILE_OFFSET_BITS=64 -D_POSIX_THREAD_SAFE_FUNCTIONS -D_CRT_RAND_S -DWIN32_LEAN_AND_MEAN -DNOMINMAX
 GENARCH  ?= -march=x86-64-v3  # AVX2 + FMA for the lifted FP/SIMD code (simd.h); override for older CPUs
 GENFLAGS += -D_FILE_OFFSET_BITS=64 $(GENARCH)
 LDFLAGS  := -fuse-ld=lld -Wl,--stack,16777216 $(if $(DEPS),-L$(DEPS)/lib) -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
             -lvulkan-1 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared -Wl,-Bstatic -lzstd -Wl,-Bdynamic \
-            $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows)  # release: no console window (log -> lasrecomp.log)
+            $(if $(CONSOLE),,-Wl$(comma)--subsystem$(comma)windows)  # no console window (log -> lasrecomp.log next to the
+            # exe; a pipe from a test harness still gets it: runtime/platform/windows.c). CONSOLE=1: the old console build
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 BACKEND_OBJ += $(B)/rt/platform/windows_rc.o  # the .exe's icon (Explorer, taskbar)
@@ -115,7 +117,7 @@ RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))
 RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn $(DEPINC) $(OSFLAGS)
 CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(DEPINC)
 
-all: $(EXE) $(if $(GEN_SRC),$(GAMELIB))
+all: $(EXE) $(if $(GEN_SRC),$(GAMELIB)) $(PLAY_EXE)
 
 $(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h
 	@mkdir -p $(dir $@)
@@ -198,6 +200,10 @@ gen-objs: $(GEN_OBJ)
 # Runtime objects only (no generated code, no link): quick compile check
 runtime-objs: $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ)
 
+# PokemonSword-Play.exe: the game straight away, no start screen (tools/play_direct.c; Windows only)
+$(PLAY_EXE): tools/play_direct.c $(B)/rt/platform/windows_rc.o
+	TMP=$(B) TEMP=$(B) $(CC) -O2 -municode -mwindows -o $@ $^
+
 $(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc docs/icon/icon.ico runtime/platform/windows.manifest
 	@mkdir -p $(dir $@)
 	$(WINDRES) -I docs/icon -I runtime/platform -O coff $< -o $@
@@ -219,9 +225,10 @@ dist:
 	@[ -d build/helper/lasgen ] || { echo "make gen-helper first (the game code generator)"; exit 1; }
 	@[ -x build/zig/zig.exe ] || { echo "tools/fetch_zig.sh first (the compiler)"; exit 1; }
 	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win RELEASE=1 EXE_NAME=PokemonSword $(WIN_B)/PokemonSword.exe
-	! nm $(WIN_B)/SwShRecomp.exe | grep ' f_70' >/dev/null  # (no game code inside)
+	! nm $(WIN_B)/PokemonSword.exe | grep ' f_70' >/dev/null  # (no game code inside)
 	rm -rf build/dist && mkdir -p "$(DIST)/gamelib-src"
-	cp $(WIN_B)/PokemonSword.exe $(WIN_B)/lasrecomp.dll.a "$(DIST)/"
+	$(MAKE) B=$(WIN_B) DEPS=$(CURDIR)/build/deps-win RELEASE=1 EXE_NAME=PokemonSword $(WIN_B)/PokemonSword-Play.exe
+	cp $(WIN_B)/PokemonSword.exe $(WIN_B)/PokemonSword-Play.exe $(WIN_B)/lasrecomp.dll.a "$(DIST)/"
 	tools/zig_slim.sh $(strip $(filter-out -Iruntime,$(GENFLAGS)))  # (zig with its runtime built ahead of time)
 	cp -R build/helper/lasgen "$(DIST)/"
 	cp -R build/zig-slim "$(DIST)/zig"
@@ -233,18 +240,34 @@ dist:
 	cp LICENSE "$(DIST)/LICENSE.txt"
 	cp LICENSE-LASRecomp "$(DIST)/LICENSE-LASRecomp.txt"
 	cp docs/release-README.txt "$(DIST)/README.txt"
-	# nstool (MIT, jakcron) and the console keys: the start screen unpacks .xci / .nsp with them (runtime/gamesetup.c).
-	# PRIVATE FORK ONLY: third_party/nstool/prod.keys must never go into a public release or repository.
+	# nstool (MIT, jakcron): the start screen unpacks .xci / .nsp with it and the player's own prod.keys (runtime/gamesetup.c).
+	# The keys are NEVER shipped: a public release has none (the player adds theirs). PRIVATE_KEYS=1 puts
+	# third_party/nstool/prod.keys in a private copy only - such a zip / installer must not be uploaded.
 	cp third_party/nstool/nstool.exe "$(DIST)/"
-	if [ -f third_party/nstool/prod.keys ]; then cp third_party/nstool/prod.keys "$(DIST)/"; fi
+	if [ "$(PRIVATE_KEYS)" = 1 ] && [ -f third_party/nstool/prod.keys ]; then cp third_party/nstool/prod.keys "$(DIST)/"; fi
+	[ "$(PRIVATE_KEYS)" = 1 ] || ! find "$(DIST)" -iname '*.keys' | grep .  # (no keys in a public release)
 	# NVIDIA's DLSS model (DLAA: runtime/nvn/vulkan/dlss.c), redistributed as NVIDIA's DLSS SDK allows; not in git
 	# (58 MB): put nvngx_dlss.dll in build/dlss/ before `make dist`, or the release goes without it (TAA instead)
 	if [ -f build/dlss/nvngx_dlss.dll ]; then cp build/dlss/nvngx_dlss.dll "$(DIST)/"; else echo "(no build/dlss/nvngx_dlss.dll: DLAA left out)"; fi
+	# Intel's XeSS runtime (anti-aliasing "XeSS": runtime/nvn/vulkan/xess.c), redistributable under the Intel Simplified
+	# Software License (third_party/xess/LICENSE.txt); not in git (78 MB): libxess.dll from the XeSS SDK
+	# (github.com/intel/xess releases) in build/xess/ before `make dist`, or the release goes without it (TAA instead)
+	if [ -f build/xess/libxess.dll ]; then cp build/xess/libxess.dll "$(DIST)/" && cp third_party/xess/LICENSE.txt "$(DIST)/LICENSE-XeSS.txt"; \
+	    else echo "(no build/xess/libxess.dll: XeSS left out)"; fi
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/PokemonSword.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
 	    xargs -I{} cp -u {} "$(DIST)/"
 	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)
 	cd build/dist && zip -qr "PokemonSword-$(VERSION)-windows.zip" PokemonSword
 	@echo "build/dist/PokemonSword-$(VERSION)-windows.zip"
+
+# The Windows installer (NSIS: pacman -S mingw-w64-ucrt-x86_64-nsis) from the dist folder: per-user, no admin rights
+# (tools/installer.nsi). make dist first.
+installer:
+	@[ -d "$(DIST)" ] || { echo "make dist first"; exit 1; }
+	! find "$(DIST)" -iname '*.keys' | grep .  # (never an installer with keys in it)
+	makensis -V2 -DVERSION=$(VERSION) -DSRC="$$(cygpath -w $(CURDIR)/$(DIST))" -DICON="$$(cygpath -w $(CURDIR)/docs/icon/icon.ico)" \
+	    -DOUT="$$(cygpath -w $(CURDIR)/build/dist/PokemonSword-$(VERSION)-setup.exe)" tools/installer.nsi
+	@echo "build/dist/PokemonSword-$(VERSION)-setup.exe"
 
 # The game code generator as a standalone helper, so players need no Python (tools/lasgen.spec): build/helper/lasgen/,
 # shipped as lasgen/ next to the exe. The start screen's setup runs it on the player's own game files.
@@ -259,4 +282,4 @@ gen-helper:
 jogo:
 	tools/publicar_jogo.sh
 
-.PHONY: all gen gen-objs runtime-objs dist deps-windows gen-helper jogo
+.PHONY: all gen gen-objs runtime-objs dist deps-windows gen-helper jogo installer

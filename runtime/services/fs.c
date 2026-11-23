@@ -520,6 +520,7 @@ static void aoc_pack_folders(const char *dir, uint64_t base_id) {
 }
 
 int aoc_list(uint64_t base_id, uint32_t *indices, int max) {
+    if (getenv("LARECOMP_NO_AOC")) return 0;  // tests: play as if no DLC were installed (no folder renaming)
     char dir[1024];
     aoc_dir(dir, sizeof dir);
     static uint64_t packed_for;  // (once per game: a reboot into the other one looks again)

@@ -177,6 +177,11 @@ int main(int argc, char **argv) {
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+    // --play (PokemonSword-Play.exe) before the game files are set up: the start screen, where they are added
+    if (skip_launcher && !getenv("LARECOMP_NO_LAUNCHER") && !getenv("LARECOMP_INPUT") && !setup_ready()) {
+        LOG("[boot] --play: the game files are not set up yet, showing the start screen\n");
+        skip_launcher = false;
+    }
     for (bool title = !skip_launcher;;) {
         if (title) {  // start screen: resolution, fullscreen, anti-aliasing, translation, keys (runtime/ui/launcher_lg.mm)
             extern void launcher_lg_run(const char *root);

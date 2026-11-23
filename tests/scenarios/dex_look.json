@@ -1,0 +1,8 @@
+{
+ "description": "player's save 2026-11-22 14:52 (Pokedex, more items): load and open the X menu (where things are)",
+ "save": "build/scenario-saves/user_dex",
+ "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8,1700:X:4",
+ "exit_at": 1800,
+ "measure": [1700, 1800],
+ "shots": [1500, 1650, 1760, 1790]
+}

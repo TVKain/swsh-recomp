@@ -152,6 +152,12 @@ static bool format_supports(VkFormat f, VkFormatFeatureFlags want) {
 static float g_rs_x = 1, g_rs_y = 1;
 void renderer_get_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }
 void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
+// XeSS upscaling (exec.c xess_upscale): the 3D scene's targets are drawn at g_scene_k of the output's scale (1: off).
+// Targets marked as output (vk_tex_mark_output: the game's scene upscale and the HUD passes after it) keep the output's.
+static float g_scene_k = 1;
+bool vk_tex_mark_output(NvnTexture *t);
+void renderer_set_scene_scale(float k) { g_scene_k = k > 0 && k <= 2 ? k : 1; }  // (> 1: XeSS native full size enlarges the 80% scene)
+float renderer_scene_scale(void) { return g_scene_k; }
 uint64_t renderer_present_count(void);
 
 static bool tex_scalable(const NvnTexture *t) {
@@ -214,6 +220,7 @@ bool renderer_texture_level_fresh(NvnTexture *t) {
 void renderer_texture_mark_presented(NvnTexture *t) {
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     if (b) b->presented = true;
+    if (b && !b->out && g_scene_k != 1) vk_tex_mark_output(t);  // (what reaches the window: the output's size)
 }
 
 bool renderer_texture_presented(NvnTexture *t) {
@@ -256,10 +263,19 @@ void vk_collect_dead(void) {
     ndead = k;
 }
 
+// the scale a scalable texture is allocated at: the shadow map's, the output's (output targets), or the scene's
+static void target_scale(const TexBackend *b, float *kx, float *ky) {
+    if (b->shadow) { *kx = *ky = shadow_k(); return; }
+    float k = b->out || b->presented ? 1.0f : g_scene_k;  // (what reaches the window: the output's size)
+    *kx = g_rs_x * k, *ky = g_rs_y * k;
+}
+
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
-    b->sx = b->scalable ? (b->shadow ? shadow_k() : g_rs_x) : 1;
-    b->sy = b->scalable ? (b->shadow ? shadow_k() : g_rs_y) : 1;
+    float kx = 1, ky = 1;
+    if (b->scalable) target_scale(b, &kx, &ky);
+    b->sx = kx;
+    b->sy = ky;
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
     if (b->scalable) {
         tw = (uint32_t)lroundf(tw * b->sx); th = (uint32_t)lroundf(th * b->sy);
@@ -390,10 +406,38 @@ static void live_remove(TexBackend *b) {
 static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
-        float kx = b->shadow ? shadow_k() : g_rs_x, ky = b->shadow ? shadow_k() : g_rs_y;
+        float kx = 1, ky = 1;
+        if (b->scalable) target_scale(b, &kx, &ky);
         if (b->scalable && (b->sx != kx || b->sy != ky)) {  // output resolution (or shadow map scale) changed: reallocate
+            // The old contents are scaled into the new image: XeSS upscaling changes the scene's scale whenever the game
+            // flips between 80% and 100% of its targets (field <-> battle), and a texture the game drew once before the
+            // flip (the battle's town backdrop) was otherwise left empty - grey backgrounds at the start of encounters.
+            VkImage old = b->image;
+            uint32_t ow = b->width, oh = b->height, olv = b->levels, oly = b->layers;
+            VkImageAspectFlags oa = b->aspect;
+            bool keep = old && !b->shadow && b->samples == 1 && b->depth == 1 && oa == VK_IMAGE_ASPECT_COLOR_BIT &&
+                        !getenv("LARECOMP_NO_REALLOC_COPY");
             destroy_image(b);
             create_image(t, b);
+            if (keep && b->aspect == oa && b->layers == oly &&
+                format_supports(b->format, VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
+                VkCommandBuffer cb = vk_upload_cmd();
+                VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                       .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                       .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+                VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+                vkCmdPipelineBarrier2(cb, &di);
+                bool lin = format_supports(b->format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+                uint32_t nlv = olv < b->levels ? olv : b->levels;
+                for (uint32_t lv = 0; lv < nlv; lv++) {
+                    uint32_t sw = ow >> lv, sh = oh >> lv, dw = b->width >> lv, dh = b->height >> lv;
+                    VkImageBlit r = {.srcSubresource = {oa, lv, 0, oly}, .srcOffsets = {{0, 0, 0}, {(int32_t)(sw ? sw : 1), (int32_t)(sh ? sh : 1), 1}},
+                                     .dstSubresource = {oa, lv, 0, oly}, .dstOffsets = {{0, 0, 0}, {(int32_t)(dw ? dw : 1), (int32_t)(dh ? dh : 1), 1}}};
+                    vkCmdBlitImage(cb, old, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &r,
+                                   lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+                }
+                vkCmdPipelineBarrier2(cb, &di);
+            }
         }
         return b;
     }
@@ -430,6 +474,18 @@ void vk_tex_shadow_pair(NvnTexture *depth, NvnTexture *color) {
         color->format, (unsigned long long)color->addr);
     destroy_image(c);
     create_image(color, c);
+}
+
+// An output target (XeSS upscaling): kept at the output's scale whatever the scene's is. true: newly marked (its image
+// is made again at the next use, outside this pass).
+bool vk_tex_mark_output(NvnTexture *t) {
+    if (!t || !t->backend) return false;
+    TexBackend *b = t->backend;
+    if (b->out || b->shadow) return false;
+    b->out = true;
+    if (b->scalable) LOG("[xess] output target %ux%u fmt %#x at %llx: drawn at the output's size\n", t->width, t->height, t->format,
+                         (unsigned long long)t->addr);
+    return b->scalable;
 }
 
 void vk_tex_unscale(NvnTexture *t) {
@@ -951,6 +1007,17 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
     if (mf <= 1) si.maxLod = si.minLod + 0.25f;  // not mipmapped: stay on the base level
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
     si.mipLodBias = d->lod_bias;
+    {   // XeSS upscaling: the scene's textures sampled as at the output's size (Intel's guidance: bias log2(1 / ratio)),
+        // decided at the first sampler (samplers are kept: a change applies at the next start). LARECOMP_MIP_BIAS=<b>.
+        static float bias = 1;
+        if (bias > 0) {
+            extern float xess_mip_bias(void);
+            bias = getenv("LARECOMP_MIP_BIAS") ? (float)atof(getenv("LARECOMP_MIP_BIAS")) : xess_mip_bias();
+            if (bias > 0) bias = 0;
+            if (bias < 0) LOG("[xess] texture mip bias %.2f (upscaling)\n", bias);
+        }
+        if (mf >= 2) si.mipLodBias += bias;
+    }
     if (d->max_aniso > 1) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = fminf(d->max_aniso, 16); }
     // Anisotropic filtering raised to 16x (textures stay sharp at grazing angles: paths and grass towards the top of
     // the screen): the game asks for little or none, sized for the Switch. Mipmapped, linearly filtered colour samplers

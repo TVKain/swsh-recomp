@@ -1,0 +1,8 @@
+{
+ "description": "F12 settings by controller: hold View, A on a row (list opens), down, A (picked), B once -> the settings must close (player: needed B twice)",
+ "save": "build/scenario-saves/empty",
+ "input": "",
+ "exit_at": 700,
+ "measure": [600, 700],
+ "shots": []
+}

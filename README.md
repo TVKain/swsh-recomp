@@ -6,10 +6,16 @@ Switch (system services, NVN graphics on Vulkan, audio, controllers). **It is no
 **[Let's Go Recomp](https://github.com/raulzrrs/letsgo-recomp)**, itself built on
 **[LAS Recomp](https://github.com/peiikai/LASRecomp)** by Peiikai.
 
+**This fork** ([TVKain/swsh-recomp](https://github.com/TVKain/swsh-recomp)) adds: a Windows installer and setup straight
+from `.xci` / `.nsp` + `prod.keys`, Intel Arc fixes (striped characters, floor glitches, thin lines), battles, menus and
+cutscenes at the right speed at 60 fps, Intel XeSS and a new TAA, per-object motion vectors (no ghosting), controller-first
+menus with sounds, and Mystery Gift no longer closing itself. Based on upstream
+[raulzrrs/swsh-recomp](https://github.com/raulzrrs/swsh-recomp).
+
 > [!IMPORTANT]
-> **No game files are included.** You need your own legally obtained copy of *Pokémon Sword* or *Shield*, extracted
-> (the `exefs` and `romfs` folders). This repository does not provide the game, its keys, or instructions on how to
-> obtain them. A fan project, not affiliated with Nintendo, The Pokémon Company, Game Freak or Creatures.
+> **No game files or keys are included.** You need your own legally obtained copy of *Pokémon Sword* or *Shield* and
+> its keys, dumped from your own Switch. A fan project, not affiliated with Nintendo, The Pokémon Company, Game Freak
+> or Creatures.
 
 > [!NOTE]
 > **Work in progress.** Tested with *Sword* 1.3.2 and its Expansion Pass on one PC; *Shield* has **not been tested**
@@ -80,21 +86,30 @@ this port has:
 
 ## How to play
 
-1. Download `SwShRecomp-<version>-windows.zip` from [Releases](../../releases) and unzip it into a folder you can
-   write to (not inside Program Files).
-2. Open **`SwShRecomp.exe`** (if Windows warns, **More info** → **Run anyway**).
-3. Click **Select game folder...** and pick the folder with your extracted game (`exefs` and `romfs`).
-4. Wait while it copies the files and recompiles the game for your PC. This happens only once and takes a while
-   (about 40 minutes on a 20-thread CPU, measured on a fresh install; longer with fewer threads).
+**You need:** your own Pokémon Sword dumped from your own Switch: the game (`.xci` or `.nsp`), the **1.3.2 update**
+(`.nsp`), optionally the two DLC `.nsp` files, and your console keys (`prod.keys`, for example from Lockpick_RCM;
+an emulator's keys are found by themselves). Or a folder with the game already extracted (`exefs` and `romfs`).
+Keep about **60 GB** free for the one-time setup (about 20 GB stay used).
+
+1. Download **`PokemonSword-<version>-setup.exe`** from [Releases](../../releases) and run it. It installs for your
+   user only, no administrator rights, into `%LOCALAPPDATA%\Programs\Pokemon Sword`. (Prefer no installer? Unzip
+   `PokemonSword-<version>-windows.zip` into a folder you can write to.) The program isn't code-signed: if Windows
+   warns, click **More info** → **Run anyway**.
+2. Open **Pokemon Sword Recomp** from the Start menu or the desktop.
+3. On the **Game** page click **Choose game files** and select everything at once with Ctrl+click: the game, the
+   update, the DLC and `prod.keys`. (A `prod.keys` in the same folder as the game files is picked up by itself; the
+   **Console keys** row shows whether keys were found and lets you choose a file.) With an extracted game, use
+   **Use an extracted folder** instead.
+4. Wait while it unpacks the files and recompiles the game for your PC. This happens only once (about 20–60 minutes,
+   depending on the CPU).
 5. Click **Play**.
 
-Everything stays in that folder (settings in `larecomp.ini`, saves in `save-sword` / `save-shield`, shader caches, the
-log `lasrecomp.log`). To
-update, unzip a new release over it.
+Everything stays in the install folder: settings in `larecomp.ini`, saves in `save-sword`, your keys in `keys`, the
+game copy in `extracted`, shader caches in `cache`, the log `lasrecomp.log`. Installing a newer version over it keeps
+all of that. Uninstalling keeps saves, settings and keys, and asks before deleting the game copy.
 
-**On the first start** the game's shaders are prepared for your GPU in the background (about 6 minutes on an 8-core
-CPU; the title screen runs slower meanwhile, and the game is playable). After that a first visit to a place mostly just
-links what was prepared; what isn't in the game files is still compiled when first seen, which can hitch for a moment.
+**On the first start** the game's shaders are prepared for your GPU in the background (several minutes; the game may
+stutter meanwhile). After that they are kept on disk.
 
 ## Known issues
 

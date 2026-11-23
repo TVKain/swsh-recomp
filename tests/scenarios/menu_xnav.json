@@ -1,0 +1,8 @@
+{
+ "description": "X menu: RIGHT presses (icon highlight animation) 30 vs 60 (research, MENU60)",
+ "save": "build/scenario-saves/user_grass",
+ "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8,1700:X:4,1760:RIGHT:4",
+ "exit_at": 1790,
+ "measure": [1740, 1790],
+ "shots": [1758, 1760, 1761, 1762, 1763, 1764, 1765, 1766, 1767, 1768, 1770, 1772, 1775, 1780]
+}

@@ -1,0 +1,8 @@
+{
+ "description": "X menu -> Options: hold DOWN (cursor key repeat) 30 vs 60 (research, MENU60)",
+ "save": "build/scenario-saves/user_grass",
+ "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8,1700:X:4,1730:DOWN:4,1760:A:4,1840:DOWN:30",
+ "exit_at": 1900,
+ "measure": [1830, 1900],
+ "shots": [1830, 1840, 1842, 1844, 1846, 1848, 1850, 1852, 1854, 1856, 1858, 1860, 1862, 1864, 1866, 1868, 1870, 1872, 1874]
+}

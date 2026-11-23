@@ -73,7 +73,15 @@ static void self_controller(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s;
     switch (req->cmd) {
     case 0: LOG("[am] application requested exit\n"); exit(0);
-    case 9: resp->copy_handles[resp->ncopy++] = new_event(); break;
+    case 9: {  // GetLibraryAppletLaunchableEvent: signalled (a library applet may launch now; the Mystery Gift menu waited on it)
+        uint32_t w, r;
+        KEvent *ev = kernel_create_event_pair(&w, &r);
+        pthread_mutex_lock(&g_klock);
+        kernel_signal(ev);
+        pthread_mutex_unlock(&g_klock);
+        resp->copy_handles[resp->ncopy++] = r;
+        break;
+    }
     case 40: OUT(uint64_t, 0) = 1; resp_size(resp, 8); break;  // CreateManagedDisplayLayer
     case 69: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;
     default: UNHANDLED("ISelfController");
@@ -106,6 +114,11 @@ static void storage_accessor(Service *s, IpcReq *req, IpcResp *resp) {
         uint64_t n = a->size;
         if ((uint64_t)off + n > st->size) n = st->size - (uint64_t)off;
         memcpy(st->data + off, (void *)(uintptr_t)a->addr, n);
+        if (getenv("LARECOMP_IPC_LOG")) {  // (research: what the game hands an applet, e.g. the error applet's code)
+            LOG("[am] storage write @%lld (%llu bytes):", (long long)off, (unsigned long long)n);
+            for (uint64_t i = 0; i < n && i < 48; i += 4) LOG(" %08x", *(uint32_t *)(st->data + off + i));
+            LOG("\n");
+        }
         break;
     }
     case 11: {  // Read(offset, B)
@@ -131,6 +144,53 @@ static Service *new_am_storage(const void *data, uint64_t size) {
     st->size = size;
     if (data) memcpy(st->data, data, size);
     return service_new("IStorage", am_storage, st);
+}
+
+// ------------------------------------------------------------------ library applets (ILibraryAppletCreator)
+// The system's own screens (error / network connection / account dialogs) are not here: an applet the game launches
+// finishes at once, as if the player closed it (GetResult: cancelled, no output data). Before, CreateLibraryApplet
+// answered with no object and the game used a null session (crash when Mystery Gift opened its connection check).
+static uint32_t signalled_am_event(void) {
+    uint32_t w, r;
+    KEvent *ev = kernel_create_event_pair(&w, &r);
+    pthread_mutex_lock(&g_klock);
+    kernel_signal(ev);
+    pthread_mutex_unlock(&g_klock);
+    return r;
+}
+
+static void applet_accessor(Service *s, IpcReq *req, IpcResp *resp) {
+    uintptr_t id = (uintptr_t)s->state;
+    switch (req->cmd) {
+    case 0: case 105: case 106: resp->copy_handles[resp->ncopy++] = signalled_am_event(); break;  // state / out-data events
+    case 1: OUT(uint8_t, 0) = 1; resp_size(resp, 1); break;   // IsCompleted
+    case 10: LOG("[am] library applet 0x%x started: closes at once (not available here)\n", (unsigned)id); break;  // Start
+    case 30: break;                                            // GetResult: ok (the error applet always is; an error broke the game)
+    case 101: case 103: resp->result = AM_NO_DATA; break;      // PopOutData / PopInteractiveOutData: none
+    case 120: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;  // NeedsToExitProcess
+    case 20: case 25: case 100: case 102: case 150: break;     // RequestExit / Terminate / Push(Interactive)InData / foreground
+    default: LOG("[am] ILibraryAppletAccessor 0x%x cmd %u (ok)\n", (unsigned)id, req->cmd);
+    }
+}
+
+static Service *new_am_storage(const void *data, uint64_t size);
+static void applet_creator(Service *s, IpcReq *req, IpcResp *resp) {
+    (void)s;
+    switch (req->cmd) {
+    case 0: {  // CreateLibraryApplet(applet id, mode)
+        uint32_t id = IN(uint32_t, 0), mode = IN(uint32_t, 4);
+        LOG("[am] CreateLibraryApplet id 0x%x mode %u\n", id, mode);
+        ipc_return_object(resp, service_new("ILibraryAppletAccessor", applet_accessor, (void *)(uintptr_t)id));
+        break;
+    }
+    case 10: ipc_return_object(resp, new_am_storage(NULL, (uint64_t)IN(int64_t, 0))); break;  // CreateStorage(size)
+    case 11: case 12: {  // CreateTransferMemoryStorage / CreateHandleStorage: a storage of that size (contents not shared)
+        uint64_t n = (uint64_t)IN(int64_t, 8);
+        ipc_return_object(resp, new_am_storage(NULL, n ? n : 0x1000));
+        break;
+    }
+    default: LOG("[am] ILibraryAppletCreator cmd %u (ok)\n", req->cmd);
+    }
 }
 
 extern const uint8_t g_user_id[16];
@@ -177,7 +237,7 @@ static void application_proxy(Service *s, IpcReq *req, IpcResp *resp) {
         {3, "IAudioController", generic_ok},
         {4, "IDisplayController", generic_ok},
         {10, "IProcessWindingController", generic_ok},
-        {11, "ILibraryAppletCreator", generic_ok},
+        {11, "ILibraryAppletCreator", applet_creator},
         {20, "IApplicationFunctions", application_functions},
         {1000, "IDebugFunctions", generic_ok},
     };

@@ -16,7 +16,14 @@ float settings_fsr3_ratio(void);  // 1.0, 1.5, 1.7, 2.0, 3.0
 // TAA: temporal, on the game's HDR scene before its bloom (runtime/nvn/vulkan/exec.c taa_run), jittered draws
 // FSR 3.1 is the fourth choice: it anti-aliases and upscales; with the others a lower internal resolution reaches the
 // window bilinearly (the upscaler follows: settings_apply_levels)
-enum { AA_OFF = 0, AA_SMAA = 1, AA_TAA = 2, AA_FSR3 = 3, AA_DLAA = 4 /* NVIDIA DLAA at TAA's place (dlss.c), TAA without it */ };
+enum { AA_OFF = 0, AA_SMAA = 1, AA_TAA = 2, AA_FSR3 = 3, AA_DLAA = 4 /* NVIDIA DLAA at TAA's place (dlss.c), TAA without it */,
+       AA_XESS = 5 /* Intel XeSS at 1x at TAA's place (xess.c), TAA without it */ };
+// XeSS's mode (antialias = AA_XESS): native AA (1x, at TAA's place) or upscaling by Intel's ratios - the 3D scene drawn
+// smaller, XeSS in place of the game's own scene upscale, the HUD at full size (exec.c xess_upscale)
+enum { XESS_Q_NATIVE = 0, XESS_Q_ULTRA_PLUS = 1, XESS_Q_ULTRA = 2, XESS_Q_QUALITY = 3, XESS_Q_BALANCED = 4,
+       XESS_Q_PERFORMANCE = 5,
+       XESS_Q_FULL = 6,  // native AA at full size: the game's scene enlarged to the output (outdoors 80% -> 100%), XeSS at 1x
+       XESS_Q_COUNT };
 // SSAO and GI quality (F12 menu): their parameters follow (settings_apply_levels); HIGH = the former defaults
 enum { FX_OFF = 0, FX_LOW = 1, FX_MEDIUM = 2, FX_HIGH = 3, FX_ULTRA = 4 };  // (ultra: SSAO only - high plus light contact shadows)
 enum { VREAD_AUTO = 0, VREAD_COPY = 1, VREAD_DIRECT = 2 };
@@ -36,6 +43,7 @@ typedef struct {
     int win_w, win_h;    // the window's size and place as last left (windowed); win_x INT_MIN: centred
     int win_x, win_y;
     bool win_max;        // maximized
+    bool vsync;          // frames wait for the display's refresh (FIFO; VRR displays follow the game): device.c present_mode
     int fps;  // 30 (the game's own), 60 or 120 (experimental): the world's rate (runtime/hle/fps60.c; F12 menu, live)
     int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
     int res_height;      // the launcher's render height in lines (720 / 1080 / 1440 / 2160); 0: res_mode decides
@@ -43,7 +51,10 @@ typedef struct {
                          // else upscaler_pick: settings_apply_levels)
     int upscaler_pick;   // (older files' upscaler choice: read, no longer used - bilinear unless FSR 3.1)
     int antialias;       // AA_*: anti-aliasing of the game image before it is scaled to the window
+    int xess_quality;    // XESS_Q_*: XeSS's mode (native AA, or an upscaling ratio)
     float volume;        // master volume, 1 = 100%
+    bool ui_sounds;      // the menus' own sounds (move, select, back: runtime/ui/ui_sound.c)
+    float ui_volume;     // their volume, 1 = 100%
     float brightness;    // colour of the game image (F12 menu, runtime/ui/menu.mm; post pass in runtime/nvn/vulkan/exec.c):
     float contrast;      // 1 = unchanged for all three; brightness / contrast 0.5..1.5, saturation 0..2
     float saturation;

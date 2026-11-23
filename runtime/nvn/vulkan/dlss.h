@@ -18,6 +18,9 @@ typedef struct {
     float jx, jy;                      // this frame's jitter in render pixels: how far the content moved (right, down)
     float mv_scale_x, mv_scale_y;      // the motion vectors to pixels, previous - current
     bool reset;                        // no history (a cut, the first frame)
+    int xq;                            // XeSS only: XESS_Q_* (0 = native AA)
+    bool ldr;                          // XeSS only: the colour is the tone-mapped image (upscaling), not HDR
+    VkImage mask;                      // XeSS only: R8 responsive mask at the input's size (none: VK_NULL_HANDLE)
 } DlssInput;
 
 // The extensions NGX asks for, added when the driver has an NGX core and nvngx_dlss.dll is next to the executable.

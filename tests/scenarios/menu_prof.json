@@ -1,0 +1,14 @@
+{
+ "description": "X menu open and idle: FNPROF windows (research, MENU60)",
+ "save": "build/scenario-saves/user_grass",
+ "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8,1700:X:4",
+ "exit_at": 1790,
+ "measure": [
+  1650,
+  1790
+ ],
+ "shots": [
+  1660,
+  1780
+ ]
+}

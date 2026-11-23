@@ -20,9 +20,12 @@ static const char *settings_file(void) {
 Settings g_settings = {
     .fullscreen = false,
     .window_mode = -1,  // (-1: no window_mode line in the file - from its fullscreen line then, else windowed)
+    .vsync = true,
     .win_w = 1280, .win_h = 720, .win_x = INT_MIN, .win_y = INT_MIN,
     .fps = 30,
     .volume = 1.0f,
+    .ui_sounds = true,
+    .ui_volume = 0.6f,
     .brightness = 1.0f,
     .contrast = 1.0f,
     .saturation = 1.0f,
@@ -32,7 +35,7 @@ Settings g_settings = {
     .ssao_temporal = true,
     .ssao_samples = 16,
     .shadow_filter = SHADOW_SMOOTH,
-    .outlines = OUTLINE_SMOOTH,
+    .outlines = OUTLINE_OFF,  // (player 2026-11-22: "keeping outline off is the best")
     .ui2x = true,
     .blur_quality = true,
     .mv_objects = true,
@@ -60,6 +63,7 @@ Settings g_settings = {
     .vertex_read = VREAD_AUTO,
     .upscaler = UPSCALE_SHARP,
     .upscaler_pick = UPSCALE_SHARP,
+    .res_height = 1080,  // (a fixed render height: no Automatic)
     .antialias = AA_SMAA,  // (the game has no anti-aliasing of its own)
 };
 
@@ -85,9 +89,17 @@ static void parse_line(const char *line) {
         int x, y;
         if (sscanf(val, "%d,%d", &x, &y) == 2) g_settings.win_x = x, g_settings.win_y = y;
     } else if (!strcmp(key, "window_maximized")) g_settings.win_max = atoi(val) != 0;
+    else if (!strcmp(key, "vsync")) g_settings.vsync = atoi(val) != 0;
     else if (!strcmp(key, "fps")) g_settings.fps = atoi(val) == 120 ? 120 : atoi(val) == 60 ? 60 : 30;
     else if (!strcmp(key, "render_height")) g_settings.res_height = atoi(val) >= 360 && atoi(val) <= 4320 ? atoi(val) : 0;
     else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
+    else if (!strcmp(key, "ui_sounds")) g_settings.ui_sounds = atoi(val) != 0;
+    else if (!strcmp(key, "ui_volume")) g_settings.ui_volume = (float)atof(val);
+    else if (!strcmp(key, "xess_quality")) {
+        static const char *const q[XESS_Q_COUNT] = {"native", "ultra_quality_plus", "ultra_quality", "quality", "balanced", "performance", "native_full"};
+        for (int i = 0; i < XESS_Q_COUNT; i++)
+            if (!strcmp(val, q[i])) g_settings.xess_quality = i;
+    }
     else if (!strcmp(key, "brightness")) g_settings.brightness = (float)atof(val);
     else if (!strcmp(key, "contrast")) g_settings.contrast = (float)atof(val);
     else if (!strcmp(key, "saturation")) g_settings.saturation = (float)atof(val);
@@ -130,7 +142,7 @@ static void parse_line(const char *line) {
     else if (!strcmp(key, "smaa")) g_settings.antialias = atoi(val) != 0 ? AA_SMAA : AA_OFF;
     // (after "smaa" in the file: the choice among the three; "smaa" stays for older versions)
     else if (!strcmp(key, "aa"))
-        g_settings.antialias = !strcmp(val, "dlaa") ? AA_DLAA : !strcmp(val, "fsr3") ? AA_FSR3 : !strcmp(val, "taa") ? AA_TAA : !strcmp(val, "smaa") ? AA_SMAA : AA_OFF;
+        g_settings.antialias = !strcmp(val, "xess") ? AA_XESS : !strcmp(val, "dlaa") ? AA_DLAA : !strcmp(val, "fsr3") ? AA_FSR3 : !strcmp(val, "taa") ? AA_TAA : !strcmp(val, "smaa") ? AA_SMAA : AA_OFF;
     else if (!strcmp(key, "taa_sharpness")) g_settings.taa_sharpness = (float)atof(val);
     else if (!strcmp(key, "fsr3_sharpness")) g_settings.fsr3_sharpness = (float)atof(val);
     else if (!strcmp(key, "fsr3_preset"))
@@ -232,8 +244,14 @@ void settings_load(void) {
     // (a file from before the window modes: its fullscreen line - borderless, what SDL's full screen was)
     if (g_settings.window_mode < 0) g_settings.window_mode = g_settings.fullscreen ? WINDOW_BORDERLESS : WINDOW_WINDOWED;
     g_settings.fullscreen = g_settings.window_mode != WINDOW_WINDOWED;
+    // A fixed render height only (2026-11-22, player: no Automatic resolution): Automatic / dynamic / match display
+    // become 1080p
+    if (g_settings.res_height <= 0) g_settings.res_height = 1080;
+    if (g_settings.res_mode == RES_DYNAMIC) g_settings.res_mode = RES_MATCH;
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
+    if (!(g_settings.ui_volume >= 0)) g_settings.ui_volume = 0;
+    if (g_settings.ui_volume > 1) g_settings.ui_volume = 1;
     settings_clamp_color();
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
 }
@@ -248,12 +266,18 @@ void settings_save(void) {
     fprintf(f, "window_size = %dx%d\n", g_settings.win_w, g_settings.win_h);
     if (g_settings.win_x != INT_MIN) fprintf(f, "window_pos = %d,%d\n", g_settings.win_x, g_settings.win_y);
     fprintf(f, "window_maximized = %d\n", g_settings.win_max);
+    fprintf(f, "vsync = %d\n", g_settings.vsync);
     fprintf(f, "fps = %d\n", g_settings.fps);
     fprintf(f, "render_height = %d\n", g_settings.res_height);
-    fprintf(f, "smaa = %d\n", g_settings.antialias != AA_OFF);
-    fprintf(f, "aa = %s\n", g_settings.antialias == AA_DLAA ? "dlaa" : g_settings.antialias == AA_FSR3 ? "fsr3" :
+    fprintf(f, "smaa = %d\n", g_settings.antialias == AA_SMAA);  // (older versions only; "aa" below is the choice - was 1 for any anti-aliasing, which read as "SMAA on")
+    fprintf(f, "aa = %s\n", g_settings.antialias == AA_XESS ? "xess" : g_settings.antialias == AA_DLAA ? "dlaa" : g_settings.antialias == AA_FSR3 ? "fsr3" :
                             g_settings.antialias == AA_TAA ? "taa" :
                             g_settings.antialias == AA_SMAA ? "smaa" : "off");
+    {
+        static const char *const q[XESS_Q_COUNT] = {"native", "ultra_quality_plus", "ultra_quality", "quality", "balanced", "performance", "native_full"};
+        int x = g_settings.xess_quality >= 0 && g_settings.xess_quality < XESS_Q_COUNT ? g_settings.xess_quality : 0;
+        fprintf(f, "xess_quality = %s\n", q[x]);
+    }
     fprintf(f, "upscaler = fsr1\n");  // (SwSh Recomp: always FSR 1, settings_apply_levels; for older versions)
     fprintf(f, "taa_sharpness = %.2f\n", g_settings.taa_sharpness);
     fprintf(f, "fsr3_sharpness = %.2f\n", g_settings.fsr3_sharpness);

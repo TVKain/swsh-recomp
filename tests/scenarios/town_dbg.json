@@ -1,0 +1,1 @@
+{"description": "Postwick (player's save), one debug frame at 2550 for the pass list (XeSS mode B, phase 0)", "save": "build/scenario-saves/user_latest", "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8", "exit_at": 2600, "measure": [2400, 2600], "shots": [2500, 2552]}

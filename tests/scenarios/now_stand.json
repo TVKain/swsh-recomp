@@ -1,0 +1,1 @@
+{"description": "Player save 2026-11-23 05:48: load and stand still (blue top line check)", "save": "build/scenario-saves/user_now", "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8", "exit_at": 4000, "measure": [2400, 4000], "shots": [3000, 3500]}

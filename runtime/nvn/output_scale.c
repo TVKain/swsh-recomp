@@ -95,6 +95,11 @@ static void dyn_update(double now, double gpu_ms, double target_ms) {
 }
 
 double output_scale_dynamic_factor(void) { return g_dyn; }
+// set by the renderer while XeSS upscales (vulkan/exec.c xess_upscale): the scene's own scale follows XeSS's ratio, the
+// output stays at the display's size (Dynamic = Match display)
+volatile int g_out_fixed;
+// the render size (a full-screen target) of the last frame: the FPS counter shows it
+volatile int g_out_w, g_out_h;
 
 void output_scale(double dw, double dh, bool reshape_allowed, double now, double gpu_ms, OutScale *o) {
     double fit = fmin(dw / 1920.0, dh / 1080.0);
@@ -112,7 +117,7 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     else if (mode >= 1 && mode <= 8) h = mode;
     else {
         h = reshape ? dh / 1080.0 : fit;  // Match display
-        if (mode == RES_DYNAMIC) {
+        if (mode == RES_DYNAMIC && !g_out_fixed) {
             extern bool fps60_enabled(void), fps60_world(void), fps60_menu(void), swsh60_enabled(void);
             // (Sword's 60 fps mode, hle/swsh60.c, presents every frame at 60; fps60_* is Let's Go's and never fires on
             // Sword - before 2026-11-21 Sword's dynamic resolution budgeted 33 ms a frame at 60 fps)
@@ -138,6 +143,7 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         if (qx >= 1 && qy >= 1) sx = qx / 1920.0, sy = qy / 1080.0;
     }
     o->sx = sx; o->sy = sy; o->shape = shape;
+    g_out_w = (int)lround(1920.0 * sx), g_out_h = (int)lround(1080.0 * sy);
     // where the image goes in the window: fills it when reshaped, else a fitted 16:9 box
     if (reshape) { o->vw = dw; o->vh = dh; }
     else { o->vw = 1920.0 * fit; o->vh = 1080.0 * fit; }

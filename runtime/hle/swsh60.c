@@ -216,16 +216,297 @@ bool swsh60_battle_paced(void) {
     static int off = -1;  // LARECOMP_SWSH60_NO_INPUTHOLD=1: off (A/B)
     if (off < 0) off = getenv("LARECOMP_SWSH60_NO_INPUTHOLD") != NULL;
     uint64_t b = g_battle_frame;
-    return !off && b && renderer_game_frame() + 1 - b < 4;
+    extern bool swsh60_menu_paced(void);  // (paced menus too: same lost-press problem)
+    return !off && ((b && renderer_game_frame() + 1 - b < 4) || swsh60_menu_paced());
 }
 static int btltask_hook(Cpu *c, uint64_t addr) {
     (void)addr;
     extern uint64_t renderer_game_frame(void);
     uint64_t obj = *(uint64_t *)(uintptr_t)c->x[0];
-    if (obj < 0x7000000000ull || obj >= 0x7800000000ull || *(uint64_t *)(uintptr_t)obj != SWSH132_BATTLE_MAIN_VT) return 0;
+    if (obj < 0x7000000000ull || obj >= 0x7800000000ull) return 0;
+    static int tasklog = -1;  // (research) LARECOMP_SWSH60_TASKLOG=1: each task object kind (vtable) the first time it runs
+    if (tasklog < 0) tasklog = getenv("LARECOMP_SWSH60_TASKLOG") != NULL;
+    if (tasklog) {
+        static uint64_t seen[1024];
+        static int n;
+        uint64_t vt = *(uint64_t *)(uintptr_t)obj;
+        bool found = false;
+        for (int i = 0; i < n && !found; i++) found = seen[i] == vt;
+        if (!found && n < 1024) {
+            seen[n++] = vt;
+            LOG("[tasklog] frame %llu: new task vtable %llx (obj %llx)\n", (unsigned long long)renderer_game_frame(),
+                (unsigned long long)vt, (unsigned long long)obj);
+        }
+    }
+    if (*(uint64_t *)(uintptr_t)obj != SWSH132_BATTLE_MAIN_VT) return 0;
     uint64_t f = renderer_game_frame();
+    if (!g_battle_frame) {  // (research) LARECOMP_DEBUG_AT_BATTLE=<n>: debug frame (F9) n presents after the first battle update
+        const char *e = getenv("LARECOMP_DEBUG_AT_BATTLE");
+        if (e) {
+            extern void renderer_debug_frame_at(long at);
+            renderer_debug_frame_at((long)f + atol(e));
+            LOG("[swsh60] first battle update at present %llu\n", (unsigned long long)f);
+        }
+    }
     g_battle_frame = f + 1;
     return (f & 1) ? 1 : 0;
+}
+
+// Menu / UI layout animations (MENU60, player report 2026-11-22: X menu, party icons, map cursor twice as fast at 60).
+// f_70006513d0(anim, ..., s0 = frames to advance) is the UI animation system's update; its three top-level callers
+// (lr 700064f9b8, 7000650858, 7000650304) pass a fixed 1.0 frame per update at 30 AND at 60 (logged with
+// LARECOMP_SWSH60_ANIMLOG=1) = 60 animation frames a second at 60. At 60 they pass 0.5: every update animates, at the
+// game's speed. The fourth caller (lr 7000650948) passes cross-fade weights that already follow the time (1/6 steps at
+// 30, 1/12 at 60) - left alone. Verified with tests/scenarios/menu_party.json (party icon hop: 14 samples a cycle at
+// 30, 7 at 60 unfixed). Off: LARECOMP_SWSH60_NO_UIANIM=1.
+#define SWSH132_UIANIM 0x70006513d0ull
+static int uianim_hook(Cpu *c, uint64_t addr) {
+    (void)addr;
+    uint64_t lr = c->x[30];
+    if (lr != 0x700064f9b8ull && lr != 0x7000650858ull && lr != 0x7000650304ull) return 0;
+    float s0;
+    memcpy(&s0, &c->v[0], 4);
+    if (s0 == 1.0f) {
+        s0 = 0.5f;
+        memcpy(&c->v[0], &s0, 4);
+    }
+    return 0;
+}
+// (research) LARECOMP_SWSH60_FRAMELOG=1: f_700059a680(frame object, s0 = time step): frame += speed (+8) x fps (+4) x
+// s0 - each caller with each (s0, fps) once
+#define SWSH132_UIFRAME 0x700059a680ull
+static int framelog_hook(Cpu *c, uint64_t addr) {
+    (void)addr;
+    extern uint64_t renderer_game_frame(void);
+    float s0, speed;
+    memcpy(&s0, &c->v[0], 4);
+    int32_t fps = *(int32_t *)(uintptr_t)(c->x[0] + 4);
+    memcpy(&speed, (void *)(uintptr_t)(c->x[0] + 8), 4);
+    static uint64_t seen[512];
+    static int ns;
+    uint32_t bits;
+    memcpy(&bits, &s0, 4);
+    uint64_t key = (c->x[30] & 0xffffffffull) ^ ((uint64_t)bits << 32) ^ ((uint64_t)fps << 20);
+    for (int i = 0; i < ns; i++) if (seen[i] == key) return 0;
+    if (ns < 512) seen[ns++] = key;
+    LOG("[framelog] f%llu s0 %g fps %d speed %g lr %llx\n", (unsigned long long)renderer_game_frame(), (double)s0, fps,
+        (double)speed, (unsigned long long)c->x[30]);
+    return 0;
+}
+// Party / box Pokémon icons (MENU60, player report 2026-11-22: "Scorbunny jumping fast" in the X menu's Pokémon list).
+// f_7001371210(list) animates the 7 icon slots from ONE integer counter list+0x610: for each slot f_700136bc50(slot,
+// counter) sets its layout animation (hop + sprite flip) to frame counter % length (f_700157bdb0 -> f_7000686fd0
+// stores anim+0x20), then counter += 1 - a whole animation frame per update = twice the speed at 60. At 60 each slot gets
+// counter / 2 and the half frame left over (+0.5) is added to the frame it sets: the keyframe curves are interpolated,
+// so the hop moves every update at the Switch's speed. Found with LARECOMP_SWSH60_LYTLOG / LARECOMP_TRACE_FVAL /
+// LARECOMP_WATCH_AT (menu_party.json: icon y offset, vertex cbuf word 23, loops in 14 updates at 30 and at 60 before).
+// Off: LARECOMP_SWSH60_NO_ICONS=1.
+#define SWSH132_ICON_SLOT 0x700136bc50ull   // (slot, counter)
+#define SWSH132_ANIM_SETFRAME 0x700157bdb0ull  // (layout, anim id, s0 = frame); f_700136bc50 tail-calls it
+static __thread int t_icon_half = -1;
+// (inside a battle the battle main task - and the UI it drives - already runs 30 updates a second: leave it alone)
+static bool battle_now(void) {
+    extern uint64_t renderer_game_frame(void);
+    uint64_t b = g_battle_frame;
+    return b && renderer_game_frame() + 1 - b < 4;
+}
+static bool icon_lr(uint64_t lr) { return lr >= 0x700137122cull && lr <= 0x700137128cull && (lr & 0xf) == 0xc; }
+static int icon_slot_hook(Cpu *c, uint64_t addr) {
+    (void)addr;
+    if (!icon_lr(c->x[30]) || battle_now()) return 0;
+    uint32_t n = (uint32_t)c->x[1];
+    t_icon_half = (int)(n & 1);
+    c->x[1] = n >> 1;
+    return 0;
+}
+static int anim_setframe_hook(Cpu *c, uint64_t addr) {
+    (void)addr;
+    if (t_icon_half < 0 || !icon_lr(c->x[30])) return 0;
+    if (t_icon_half) {
+        float s0;
+        memcpy(&s0, &c->v[0], 4);
+        s0 += 0.5f;
+        memcpy(&c->v[0], &s0, 4);
+    }
+    t_icon_half = -1;
+    return 0;
+}
+
+// Town Map cursor (MENU60, player report: "try moving the cursor, it's fast"). f_700150f0d0(cursor, boost flag, s0/s1 =
+// stick x/y) moves it by stick x speed (+0x28, x boost +0x2c) pixels per update - 55 px a frame at full tilt, i.e. twice
+// as far a second at 60 (measured tests/scenarios/menu_map.json: 110 px per 4 frames at 30, 215 at 60). At 60 the stick
+// is halved: the cursor moves every update at the Switch's speed. Off: LARECOMP_SWSH60_NO_MAPCURSOR=1.
+#define SWSH132_MAP_CURSOR 0x700150f0d0ull
+static int map_cursor_hook(Cpu *c, uint64_t addr) {
+    (void)addr;
+    float x, y;
+    memcpy(&x, &c->v[0], 4);
+    memcpy(&y, &c->v[1], 4);
+    x *= 0.5f, y *= 0.5f;
+    memcpy(&c->v[0], &x, 4);
+    memcpy(&c->v[1], &y, 4);
+    return 0;
+}
+
+// Held-button repeat in menus (MENU60: holding the d-pad in Options / lists scrolled twice as fast at 60, measured
+// tests/scenarios/menu_options.json). The pad object's update f_7000f203f0 keeps a repeat timer at pad+8: +0x8 first
+// delay, +0xc interval, +0x10 countdown in UPDATES; on a new button set f_7000f21890 reloads the countdown from the
+// delay (lr 7000f206a0), f_7000f218b0 counts down one per update (reloading interval - 1), the repeat bit is set while
+// it is 0. At 60 the delay and interval are doubled (2d - 1 keeps the first repeat on the same 1/30 s) right before the
+// reload; the originals are remembered so a value the game writes again is picked up. Off: LARECOMP_SWSH60_NO_REPEAT=1.
+#define SWSH132_REPEAT_RESET 0x7000f21890ull
+static int repeat_reset_hook(Cpu *c, uint64_t addr) {
+    (void)addr;
+    if (c->x[30] != 0x7000f206a0ull) return 0;
+    static struct { uint64_t t; uint32_t d, i, d2, i2; } seen[8];
+    static int n;
+    uint32_t *f = (uint32_t *)(uintptr_t)(c->x[0] + 8);  // f[0] delay, f[1] interval
+    int k = 0;
+    while (k < n && seen[k].t != c->x[0]) k++;
+    if (k == n) {
+        if (n == 8) return 0;
+        n++, seen[k].t = c->x[0], seen[k].d2 = seen[k].i2 = ~0u;
+    }
+    if (battle_now()) {  // (battle input is read on even updates only: the game's own counts, as before)
+        if (f[0] == seen[k].d2 && f[1] == seen[k].i2) f[0] = seen[k].d, f[1] = seen[k].i, seen[k].d2 = seen[k].i2 = ~0u;
+        return 0;
+    }
+    if (f[0] != seen[k].d2 || f[1] != seen[k].i2) {  // (first time, or the game set new values)
+        seen[k].d = f[0], seen[k].i = f[1];
+        seen[k].d2 = f[0] ? f[0] * 2 - 1 : 0, seen[k].i2 = f[1] * 2;
+        LOG("[swsh60] button repeat %llx: delay %u interval %u updates -> %u %u\n", (unsigned long long)c->x[0], f[0], f[1],
+            seen[k].d2, seen[k].i2);
+        f[0] = seen[k].d2, f[1] = seen[k].i2;
+    }
+    return 0;
+}
+
+// Smooth-scrolling lists (MENU60: Options / bag lists; with the repeat fixed the cursor still ran ahead at 60 because
+// the list scroll it waits for finished twice as fast). f_70015c99d0(scroller) once per update: pos (+0x1d4) += vel
+// (+0x1d8) until it crosses the target (+0x1e0, when +0x1dc is set) and calls the list's move callback; without a
+// target, every +0x1c0 updates (counter +0x1bc) vel += accel (+0x1d0), clamped to the signed max (+0x1cc). At 60 the
+// original runs with vel / 2 and the accel interval doubled; afterwards vel is put back to full speed (plus the
+// acceleration if it happened). Off: LARECOMP_SWSH60_NO_SCROLL=1.
+#define SWSH132_SCROLLER 0x70015c99d0ull
+static int scroller_hook(Cpu *c, uint64_t addr) {
+    uint64_t o = c->x[0];
+    if (battle_now()) { rt_call_original(c, addr); return 1; }
+    float *vel = (float *)(uintptr_t)(o + 0x1d8);
+    uint32_t *lim = (uint32_t *)(uintptr_t)(o + 0x1c0);
+    static struct { uint64_t o; uint32_t orig, doubled; } seen[32];
+    static int n;
+    int k = 0;
+    while (k < n && seen[k].o != o) k++;
+    if (k == n && n < 32) n++, seen[k].o = o, seen[k].doubled = ~0u;
+    if (k < 32 && *lim != seen[k].doubled) seen[k].orig = *lim, seen[k].doubled = *lim * 2, *lim = seen[k].doubled;
+    float v = *vel, half = v * 0.5f;
+    uint32_t cnt0 = *(uint32_t *)(uintptr_t)(o + 0x1bc);
+    *vel = half;
+    rt_call_original(c, addr);
+    float after = *vel;
+    if (after == half) *vel = v;  // (plain step)
+    else if (after != 0.0f && cnt0 + 1 >= *lim && *(uint32_t *)(uintptr_t)(o + 0x1bc) == 0) {  // (accelerated)
+        float mx, nv = v + (after - half);
+        memcpy(&mx, (void *)(uintptr_t)(o + 0x1cc), 4);
+        bool over = mx > 0 ? nv > mx : nv < mx;
+        *vel = over ? mx : nv;
+    }  // (else arrived / stopped: the game's own value)
+    return 1;
+}
+
+// (research, MENU60) LARECOMP_SWSH60_LYTLOG=<from present>: f_70018aa300(anim transform, pane, ...) applies a layout
+// animation (bflan FLPA / FLTP / FLVC ... tags) at the frame anim+0x20 - each call for 3 presents: object, frame, lr
+#define SWSH132_LYT_ANIMATE 0x70018aa300ull
+static int lytlog_hook(Cpu *c, uint64_t addr) {
+    (void)addr;
+    extern uint64_t renderer_game_frame(void);
+    static long from = -1;
+    if (from < 0) from = atol(getenv("LARECOMP_SWSH60_LYTLOG"));
+    long f = (long)renderer_game_frame();
+    if (f < from || f > from + 2) return 0;
+    float fr;
+    memcpy(&fr, (void *)(uintptr_t)(c->x[0] + 0x20), 4);
+    LOG("[lytlog] f%ld anim %llx frame %g vt %llx pane %llx lr %llx\n", f, (unsigned long long)c->x[0], (double)fr,
+        (unsigned long long)*(uint64_t *)(uintptr_t)c->x[0], (unsigned long long)c->x[1], (unsigned long long)c->x[30]);
+    return 0;
+}
+// (research) LARECOMP_SWSH60_ANIMLOG=1: each caller of f_70006513d0 with each non-zero s0, once
+static int animlog_hook(Cpu *c, uint64_t addr) {
+    (void)addr;
+    extern uint64_t renderer_game_frame(void);
+    static uint64_t last = 0;
+    static int n;
+    uint64_t f = renderer_game_frame();
+    if (f / 60 != last) { last = f / 60; n = 0; }
+    float s0;
+    memcpy(&s0, &c->v[0], 4);
+    static uint64_t seen[256];  // (each caller with each non-zero step once)
+    static int ns;
+    if (s0 != 0) {
+        uint32_t bits;
+        memcpy(&bits, &s0, 4);
+        uint64_t key = c->x[30] ^ ((uint64_t)bits << 40);
+        bool found = false;
+        for (int i = 0; i < ns && !found; i++) found = seen[i] == key;
+        if (!found && ns < 256) {
+            seen[ns++] = key;
+            LOG("[animlog] new: f%llu step %g from lr %llx\n", (unsigned long long)f, (double)s0, (unsigned long long)c->x[30]);
+        }
+    }
+    if (n++ < 0) {
+        LOG("[animlog] f%llu s0 %g x4 %llx x0 %llx lr %llx\n", (unsigned long long)f, (double)s0, (unsigned long long)c->x[4],
+            (unsigned long long)c->x[0], (unsigned long long)c->x[30]);
+    }
+    return 0;
+}
+
+// (research, MENU60) LARECOMP_SWSH60_VIEWLOG=1: each UI view kind (vtable of x0 at the per-view update f_7000efac20)
+// the first time it updates, with the game frame.
+#define SWSH132_VIEW_UPDATE 0x7000efac20ull
+static int viewlog_hook(Cpu *c, uint64_t addr) {
+    (void)addr;
+    extern uint64_t renderer_game_frame(void);
+    uint64_t obj = c->x[0];
+    if (obj < 0x7000000000ull || obj >= 0x7800000000ull) return 0;
+    static uint64_t seen[512];
+    static int n;
+    uint64_t vt = *(uint64_t *)(uintptr_t)obj;
+    for (int i = 0; i < n; i++) if (seen[i] == vt) return 0;
+    if (n < 512) seen[n++] = vt;
+    LOG("[viewlog] frame %llu: view vtable %llx obj %llx lr %llx\n", (unsigned long long)renderer_game_frame(),
+        (unsigned long long)vt, (unsigned long long)obj, (unsigned long long)c->x[30]);
+    return 0;
+}
+
+// X menu and the screens under it (MENU60). UI views update through f_7000efac20(view) once per update, children
+// recursively; the menus count updates for their own animations (party icon hop, cursor moves: 2x at 60, player
+// report 2026-11-22, measured: party icon cycle 14 samples at 30 fps, 7 at 60). These view kinds update on even
+// updates only at 60 = the Switch's 30 a second; the field HUD, the message windows and the rest keep 60. View kinds
+// found with LARECOMP_SWSH60_VIEWLOG (grass save: X menu 4 kinds at X, party screen 2 more). RESULT 2026-11-22: pacing
+// them (LARECOMP_SWSH60_MENU=1) left the party icon hop at 2x - not the right place; kept as a research switch.
+static const uint64_t k_menu_views[] = {
+    0x7002566200ull, 0x7002566360ull, 0x700256a398ull, 0x700256a498ull,  // X menu
+    0x70025a31e8ull, 0x70025a3478ull,                                    // Pokemon (party)
+};
+static _Atomic uint64_t g_menu_frame;  // (last update a paced menu view ran, + 1)
+static int menuview_hook(Cpu *c, uint64_t addr) {
+    (void)addr;
+    extern uint64_t renderer_game_frame(void);
+    uint64_t obj = c->x[0];
+    if (obj < 0x7000000000ull || obj >= 0x7800000000ull) return 0;
+    uint64_t vt = *(uint64_t *)(uintptr_t)obj;
+    for (size_t i = 0; i < sizeof k_menu_views / sizeof *k_menu_views; i++)
+        if (vt == k_menu_views[i]) {
+            uint64_t f = renderer_game_frame();
+            g_menu_frame = f + 1;
+            return (f & 1) ? 1 : 0;
+        }
+    return 0;
+}
+bool swsh60_menu_paced(void) {
+    extern uint64_t renderer_game_frame(void);
+    uint64_t m = g_menu_frame;
+    return m && renderer_game_frame() + 1 - m < 4;
 }
 
 // nvnWindowSetPresentInterval (runtime/nvn/objects.c): the interval the game asked for -> the one to use. The table
@@ -238,6 +519,14 @@ int swsh60_interval(int asked) {
         rt_register_fnhook_abs(0x7000687f80ull, probe_hook);
     }
     static bool dof_hooked;
+    static bool frame_hooked;
+    if (!frame_hooked && getenv("LARECOMP_SWSH60_FRAMELOG") && g_build == &k_builds[1]) { frame_hooked = true; rt_register_fnhook_abs(SWSH132_UIFRAME, framelog_hook); }
+    static bool anim_hooked;
+    if (!anim_hooked && getenv("LARECOMP_SWSH60_ANIMLOG") && g_build == &k_builds[1]) { anim_hooked = true; rt_register_fnhook_abs(SWSH132_UIANIM, animlog_hook); }
+    static bool view_hooked;
+    if (!view_hooked && getenv("LARECOMP_SWSH60_VIEWLOG") && g_build == &k_builds[1]) { view_hooked = true; rt_register_fnhook_abs(SWSH132_VIEW_UPDATE, viewlog_hook); }
+    static bool lyt_hooked;
+    if (!lyt_hooked && getenv("LARECOMP_SWSH60_LYTLOG") && g_build == &k_builds[1]) { lyt_hooked = true; rt_register_fnhook_abs(SWSH132_LYT_ANIMATE, lytlog_hook); }
     if (!dof_hooked && getenv("LARECOMP_DOF_LOG") && g_build == &k_builds[1]) { dof_hooked = true; rt_register_fnhook_abs(0x70004a7e70ull, dof_hook); LOG("[dof] hook on\n"); }
     if (!g_on) return asked;
     if (!g_applied) {
@@ -259,6 +548,33 @@ int swsh60_interval(int asked) {
         if (g_build == &k_builds[1] && !getenv("LARECOMP_SWSH60_NO_BTLTASK")) {
             rt_register_fnhook_abs(SWSH132_TASK_THUNK, btltask_hook);
             LOG("[swsh60] battle main task: 30 updates a second\n");
+        }
+        if (g_build == &k_builds[1] && !getenv("LARECOMP_SWSH60_NO_ICONS")) {
+            rt_register_fnhook_abs(SWSH132_ICON_SLOT, icon_slot_hook);
+            rt_register_fnhook_abs(SWSH132_ANIM_SETFRAME, anim_setframe_hook);
+            LOG("[swsh60] Pokemon icons: half an animation frame per update\n");
+        }
+        if (g_build == &k_builds[1] && !getenv("LARECOMP_SWSH60_NO_MAPCURSOR")) {
+            rt_register_fnhook_abs(SWSH132_MAP_CURSOR, map_cursor_hook);
+            LOG("[swsh60] Town Map cursor: half a step per update\n");
+        }
+        if (g_build == &k_builds[1] && !getenv("LARECOMP_SWSH60_NO_REPEAT")) {
+            rt_register_fnhook_abs(SWSH132_REPEAT_RESET, repeat_reset_hook);
+            LOG("[swsh60] held-button repeat: 30 fps timing\n");
+        }
+        if (g_build == &k_builds[1] && !getenv("LARECOMP_SWSH60_NO_SCROLL")) {
+            rt_register_fnhook_abs(SWSH132_SCROLLER, scroller_hook);
+            LOG("[swsh60] list scrolling: half a step per update\n");
+        }
+        // (research only: these callers are 3D model animations; halving them did not change the menu - MENU60)
+        if (g_build == &k_builds[1] && getenv("LARECOMP_SWSH60_UIANIM") && !getenv("LARECOMP_SWSH60_ANIMLOG")) {
+            rt_register_fnhook_abs(SWSH132_UIANIM, uianim_hook);
+            LOG("[swsh60] f_70006513d0 callers: half a frame per update (research)\n");
+        }
+        // (research, off by default: pacing these views did NOT slow the party icon hop - its counter is elsewhere)
+        if (g_build == &k_builds[1] && getenv("LARECOMP_SWSH60_MENU") && !getenv("LARECOMP_SWSH60_VIEWLOG")) {
+            rt_register_fnhook_abs(SWSH132_VIEW_UPDATE, menuview_hook);
+            LOG("[swsh60] X menu views: 30 updates a second (research)\n");
         }
     }
     return asked == 2 ? 1 : asked;

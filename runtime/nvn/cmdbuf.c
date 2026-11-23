@@ -501,10 +501,22 @@ static void tex_ref(TexRef *t, uint64_t tex, uint64_t view, uint64_t region) {
     if (view) { t->has_view = 1; memcpy(&t->view, (void *)(uintptr_t)view, sizeof t->view); }
     if (region) memcpy(t->region, (void *)(uintptr_t)region, sizeof t->region);
 }
+// (research) LARECOMP_COPY_DST=<texture address hex>: log each copy into the texture at that guest address (source, region,
+// caller) - which code animates a texture by copying into it (the party icon's sprite poses)
+static uint64_t copy_dst_watch(void) {
+    static uint64_t a = 1;
+    if (a == 1) a = getenv("LARECOMP_COPY_DST") ? strtoull(getenv("LARECOMP_COPY_DST"), NULL, 16) : 0;
+    return a;
+}
 NVN(nvnCommandBufferCopyBufferToTexture) {  // (cmd, src, dst, dstView, dstRegion, flags)
     Snap s = snap(c);
     TexRef t = {0};
     tex_ref(&t, s.x[2], s.x[3], s.x[4]);
+    if (copy_dst_watch() && t.tex && ((NvnTexture *)(uintptr_t)t.tex)->addr == copy_dst_watch()) {
+        extern uint64_t renderer_game_frame(void);
+        LOG("[copydst] f%llu buffer->tex src %llx region %d %d %d %d lr %llx\n", (unsigned long long)renderer_game_frame(),
+            (unsigned long long)s.x[1], t.region[0], t.region[1], t.region[3], t.region[4], (unsigned long long)c->x[30]);
+    }
     CmdRec *r = record(c, CMD_COPY_BUFFER_TO_TEXTURE, sizeof t, &s);
     memcpy(r->extra, &t, sizeof t);
 }
@@ -520,6 +532,13 @@ NVN(nvnCommandBufferCopyTextureToTexture) {  // (cmd, src, srcView, srcRegion, d
     TexRef t[2] = {{0}};
     tex_ref(&t[0], s.x[1], s.x[2], s.x[3]);
     tex_ref(&t[1], s.x[4], s.x[5], s.x[6]);
+    if (copy_dst_watch() && t[1].tex && ((NvnTexture *)(uintptr_t)t[1].tex)->addr == copy_dst_watch()) {
+        NvnTexture *st = t[0].tex ? (NvnTexture *)(uintptr_t)t[0].tex : NULL;
+        LOG("[copydst] f%llu tex->tex src %llx (%ux%u f%x) region %d %d %d %d -> %d %d %d %d lr %llx\n",
+            (unsigned long long)renderer_game_frame(), st ? (unsigned long long)st->addr : 0ull, st ? st->width : 0,
+            st ? st->height : 0, st ? st->format : 0, t[0].region[0], t[0].region[1], t[0].region[3], t[0].region[4],
+            t[1].region[0], t[1].region[1], t[1].region[3], t[1].region[4], (unsigned long long)c->x[30]);
+    }
     CmdRec *r = record(c, CMD_COPY_TEXTURE_TO_TEXTURE, sizeof t, &s);
     memcpy(r->extra, t, sizeof t);
 }
@@ -558,6 +577,26 @@ NVN(nvnCommandBufferUpdateUniformBuffer) {
             LOG("[ubo] f%llu lr %llx dst %llx+%llx src %llx: %g %g %g %g %g %g\n", (unsigned long long)renderer_game_frame(),
                 (unsigned long long)c->x[30], (unsigned long long)A(1), (unsigned long long)A(3), (unsigned long long)A(5),
                 d[0], d[1], d[2], d[3], d[4], d[5]);
+        }
+    }
+    // LARECOMP_WATCH_UBO=<present>:<size>:<word>:<min>:<max> (research, Windows): the first update of that size from that
+    // game frame on whose source word lies in [min, max]: watch who writes that source word (hle/memwatch.c)
+    static long wu_from = -2, wu_size, wu_word;
+    static float wu_min, wu_max;
+    if (wu_from == -2) {
+        const char *e = getenv("LARECOMP_WATCH_UBO");
+        wu_from = -1;
+        if (e && sscanf(e, "%ld:%ld:%ld:%f:%f", &wu_from, &wu_size, &wu_word, &wu_min, &wu_max) != 5) wu_from = -1;
+    }
+    if (wu_from >= 0 && (long)A(4) == wu_size && wu_word * 4 + 4 <= wu_size) {
+        extern uint64_t renderer_game_frame(void);
+        float v = ((const float *)(uintptr_t)A(5))[wu_word];
+        if ((long)renderer_game_frame() >= wu_from && v >= wu_min && v <= wu_max) {
+            extern void memwatch_add(uint64_t addr);
+            LOG("[watchubo] f%llu lr %llx src %llx word %ld = %g: watching\n", (unsigned long long)renderer_game_frame(),
+                (unsigned long long)c->x[30], (unsigned long long)A(5), wu_word, (double)v);
+            memwatch_add(A(5) + 4 * (uint64_t)wu_word);
+            wu_from = -1;
         }
     }
     record_copy(c, CMD_UPDATE_UNIFORM_BUFFER, 5, (uint32_t)A(4));

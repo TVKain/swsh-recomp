@@ -12,9 +12,11 @@
 
 #include "../../paths.h"
 #include "../../settings.h"
+#include "../../input_bind.h"
 #include "../../ui/menu.h"
 #include "vk.h"
 #include "dlss.h"
+#include "xess.h"
 #include "../output_scale.h"
 #include "../renderer.h"
 
@@ -54,11 +56,13 @@ static void create_instance(void) {
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
     dlss_instance_exts(ext, &n_ext, 30);  // (NVIDIA DLSS: what NGX asks for, when it can run - dlss.c)
+    uint32_t api = VK_API_VERSION_1_3;
+    xess_instance_exts(ext, &n_ext, 30, &api);  // (Intel XeSS: when libxess.dll is next to the executable - xess.c)
     bool validate = getenv("LARECOMP_VK_VALIDATION") != NULL;
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "LARecomp",
-                             .pEngineName = "LARecomp", .apiVersion = VK_API_VERSION_1_3};
+                             .pEngineName = "LARecomp", .apiVersion = api};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
@@ -229,7 +233,6 @@ static void create_device(void) {
     else if (getenv("LARECOMP_PIPE_STATS")) LOG("[vk] LARECOMP_PIPE_STATS: the driver has no VK_KHR_pipeline_executable_properties\n");
     g_fault_ext = fault;
     dlss_device_exts(ep, ne, ext, &n_ext, 40);
-    free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -261,6 +264,28 @@ static void create_device(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, .pipelineExecutableInfo = VK_TRUE,
         .pNext = f.pNext};
     if (g_pipe_exec_stats) f.pNext = &pe;
+    // (research, off by default) LARECOMP_COOPMAT=1: VK_KHR_cooperative_matrix + memory model + subgroup size control
+    // for XeSS. Measured 2026-11-23: no change in XeSS's GPU time or image (it already runs Intel's own kernels through
+    // the driver's vkCmdPushXeSSDescriptorsINTEL; xessGetIntelXeFXVersion is a D3D11-only query and reads 0 on Vulkan).
+    static VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    if (getenv("LARECOMP_COOPMAT") && has_ext(ep, ne, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR qcm = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        VkPhysicalDeviceVulkan13Features q13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = &qcm};
+        VkPhysicalDeviceVulkan12Features q12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &q13};
+        VkPhysicalDeviceFeatures2 q = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &q12};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &q);
+        if (qcm.cooperativeMatrix && n_ext < 39) {
+            ext[n_ext++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
+            cm.cooperativeMatrix = VK_TRUE;
+            cm.pNext = f.pNext, f.pNext = &cm;
+            f12.vulkanMemoryModel = q12.vulkanMemoryModel, f12.vulkanMemoryModelDeviceScope = q12.vulkanMemoryModelDeviceScope;
+            f13.subgroupSizeControl = q13.subgroupSizeControl, f13.computeFullSubgroups = q13.computeFullSubgroups;
+            LOG("[vk] cooperative matrix on (XeSS XMX path), memory model %d, subgroup size control %d\n",
+                (int)q12.vulkanMemoryModel, (int)q13.subgroupSizeControl);
+        }
+    }
+    void *chain = xess_device_setup(ep, ne, ext, &n_ext, 40, &f);  // (Intel XeSS: its extensions and features - xess.c)
+    free(ep);
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
@@ -286,7 +311,7 @@ static void create_device(void) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
                                   .queueCount = 1, .pQueuePriorities = &prio};
-    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
+    VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = chain, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
@@ -295,6 +320,7 @@ static void create_device(void) {
                                  .vulkanApiVersion = VK_API_VERSION_1_3};
     VK_CHECK(vmaCreateAllocator(&ai, &g_vk.vma));
     dlss_init();
+    xess_init();
 
     VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
                                     .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE, .initialValue = 0};
@@ -341,14 +367,21 @@ void vk_parts_cache_save(void) {  // (the end of the shader preparation, and exi
 }
 
 // ================================================================== swapchain
+static int sc_vsync = -1;  // (the VSync setting the swapchain was made with: a change recreates it, vk_frame_begin)
 static VkPresentModeKHR present_mode(void) {
-    // MAILBOX by default: the game paces itself (vi.c's emulated 60 Hz vsync), and with FIFO every submission
-    // queued behind the one waiting for a window image, so the game's fence waits followed the presentation engine:
-    // a throttled / captured / busy compositor slowed the whole game (4-21 fps with the GPU mostly idle; mailbox:
-    // 60). No tearing. LARECOMP_VK_PRESENT=fifo|immediate|mailbox to choose.
+    // VSync (g_settings.vsync, launcher / F12 graphics page, live): FIFO = every frame waits for the display's refresh;
+    // on a variable refresh rate display (the MSI Claw's 120 Hz panel, full screen or Windows' VRR for windowed games)
+    // the display then refreshes when the frame is ready: even 60 fps, no tearing. Off: MAILBOX (the newest frame
+    // replaces a waiting one, no tearing either) - the game paces itself (vi.c's emulated 60 Hz vsync) and a frame now
+    // and then stays one refresh longer as that timer and the display drift apart. MAILBOX was the default because on
+    // another machine a throttled / captured / busy compositor slowed the whole game with FIFO (4-21 fps); on the Arc
+    // 140V FIFO held 60.1 fps (grass_run 1080p60). LARECOMP_VK_PRESENT=fifo|immediate|mailbox overrides.
     const char *e = getenv("LARECOMP_VK_PRESENT");
-    VkPresentModeKHR want = !e || !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
+    sc_vsync = g_settings.vsync;
+    VkPresentModeKHR want = !e ? (g_settings.vsync ? VK_PRESENT_MODE_FIFO_KHR : VK_PRESENT_MODE_MAILBOX_KHR)
+                          : !strcmp(e, "mailbox") ? VK_PRESENT_MODE_MAILBOX_KHR
                           : !strcmp(e, "immediate") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    LOG("[vk] present mode: %s\n", want == VK_PRESENT_MODE_FIFO_KHR ? "fifo (vsync)" : want == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "immediate");
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, NULL);
     VkPresentModeKHR m[16];
@@ -441,7 +474,8 @@ bool vk_frame_begin(const float clear[4]) {
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     if (!w || !h) return false;  // minimised
-    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
+    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height || sc_vsync != g_settings.vsync)
+        recreate_swapchain();
     if (!g_vk.swapchain) return false;
     static int trace = -1;
     if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
@@ -590,6 +624,8 @@ uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 
 static uint64_t frames, total_frames, g_frame_counter;
+volatile long g_debug_frame_at_req;  // (research: a debug frame at that present, set from another thread)
+void renderer_debug_frame_at(long at) { g_debug_frame_at_req = at > 0 ? at : 1; }
 uint64_t renderer_present_count(void) { return total_frames; }
 uint64_t vk_frame_counter(void) { return g_frame_counter; }
 static float g_shot_crop[4] = {0, 0, 1, 1};
@@ -770,6 +806,8 @@ void backend_present(NvnTexture *t) {
     if (debug_at < 0) { const char *e = getenv("LARECOMP_DEBUG_FRAME"); debug_at = e ? atol(e) : 0; }
     extern volatile int g_debug_frame_request;
     if (g_debug_frame_request) { g_debug_frame_request = 0; debug_at = (long)total_frames + 1; }
+    extern volatile long g_debug_frame_at_req;  // (renderer_debug_frame_at: swsh60.c LARECOMP_DEBUG_AT_BATTLE)
+    if (g_debug_frame_at_req) { debug_at = g_debug_frame_at_req; g_debug_frame_at_req = 0; }
     // LARECOMP_DEBUG_FRAMES=<n> (with LARECOMP_DEBUG_FRAME / F9): dump n consecutive frames (build/pass_<frame>_NNN.png)
     static long debug_n = -1;
     if (debug_n < 0) { const char *e = getenv("LARECOMP_DEBUG_FRAMES"); debug_n = e && atol(e) > 1 ? atol(e) : 1; }
@@ -872,15 +910,32 @@ void window_apply_mode(void *wp) {
     int m = g_settings.window_mode;
     g_settings.fullscreen = m != WINDOW_WINDOWED;
     if (getenv("LARECOMP_WINDOW") || getenv("LARECOMP_HIDDEN")) m = WINDOW_WINDOWED;  // (test windows stay windows)
+    // SDL applies window changes asynchronously: a change asked for while the last one is still under way (exclusive <->
+    // borderless flipped quickly, or right after leaving full screen) could be dropped, the window staying borderless.
+    // So every change is waited for (SDL_SyncWindow), and a switch between the two full-screen kinds goes through a
+    // window first: SDL does not always rebuild a full-screen window whose mode alone changed.
+    bool is_full = (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN) != 0;
     if (m == WINDOW_WINDOWED) {
-        SDL_SetWindowFullscreen(w, false);
+        if (is_full) SDL_SetWindowFullscreen(w, false), SDL_SyncWindow(w);
         return;
     }
     // exclusive: the display's own mode (its resolution and refresh rate); borderless: NULL, a desktop-sized window
     const SDL_DisplayMode *dm = m == WINDOW_FULLSCREEN ? SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(w)) : NULL;
-    if (!SDL_SetWindowFullscreenMode(w, dm)) LOG("[window] full screen mode: %s\n", SDL_GetError());
-    SDL_SetWindowFullscreen(w, true);
-    LOG("[window] %s\n", m == WINDOW_FULLSCREEN ? "exclusive full screen" : "borderless full screen");
+    bool is_excl = is_full && SDL_GetWindowFullscreenMode(w) != NULL;
+    if (is_full && is_excl == (m == WINDOW_FULLSCREEN)) return;  // (already so)
+    if (is_full) SDL_SetWindowFullscreen(w, false), SDL_SyncWindow(w);
+    for (int tries = 0; tries < 3; tries++) {
+        if (!SDL_SetWindowFullscreenMode(w, dm)) LOG("[window] full screen mode: %s\n", SDL_GetError());
+        SDL_SetWindowFullscreen(w, true);
+        SDL_SyncWindow(w);
+        bool full = (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN) != 0;
+        bool excl = SDL_GetWindowFullscreenMode(w) != NULL;
+        if (full && excl == (m == WINDOW_FULLSCREEN)) break;
+        LOG("[window] full screen change not taken (full %d exclusive %d), again\n", full, excl);
+        SDL_SetWindowFullscreen(w, false), SDL_SyncWindow(w);
+    }
+    LOG("[window] %s (now: full %d, exclusive %d)\n", m == WINDOW_FULLSCREEN ? "exclusive full screen" : "borderless full screen",
+        (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN) != 0, SDL_GetWindowFullscreenMode(w) != NULL);
 }
 
 // The size and place last left (centred when that place is on no display now, e.g. a monitor unplugged)
@@ -999,6 +1054,7 @@ int ui_run(void) {
                 e.type == SDL_EVENT_WINDOW_RESTORED)
                 window_remember(window);
             if (input_user_blocked(&e)) continue;  // scripted test runs: the real keyboard / mouse / pads do nothing
+            if (bind_capture_event(&e)) continue;  // (a key being rebound in the settings: the press is the binding's)
             if (menu_handle_event(&e)) continue;
             input_handle_event(&e);
         }

@@ -81,6 +81,8 @@ typedef struct TexBackend {
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     bool scalable, presented;
     bool shadow;  // scalable as a shadow map (textures.c tex_shadow): sx = sy = the shadow map scale, not the output's
+    bool out;     // an output target (XeSS upscaling: the game's scene upscale and the HUD after it): the output's
+                  // scale; every other scalable target is the scene's, at the output's scale x renderer_scene_scale()
     uint64_t touched_frame, frame_cleared;
     uint32_t level_gen;
     float sx, sy;

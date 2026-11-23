@@ -1,0 +1,1 @@
+{"description": "Postwick (player's save), standing ~45 s with the camera still: XeSS upscaling A/B (fps, image)", "save": "build/scenario-saves/user_latest", "input": "600:A:8,800:A:8,1000:A:8,1200:A:8,1400:A:8", "exit_at": 4000, "measure": [2400, 4000], "shots": [2500, 3000, 3500, 3990]}

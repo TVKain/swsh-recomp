@@ -195,8 +195,24 @@ static DWORD WINAPI snap_thread(LPVOID arg) {
     return 0;
 }
 
+// LARECOMP_WATCH_AT=<present>: arm the LARECOMP_WATCH words only at that present (a page protected from boot can be
+// remapped / re-protected by the heap setup before the word is ever used)
+static DWORD WINAPI watch_at_thread(LPVOID arg) {
+    long at = (long)(intptr_t)arg;
+    while ((long)renderer_game_frame() < at) Sleep(5);
+    for (const char *p = getenv("LARECOMP_WATCH"); *p;) {
+        watch(strtoull(p, (char **)&p, 16));
+        while (*p == ',' || *p == ' ') p++;
+    }
+    return 0;
+}
+
 __attribute__((constructor)) static void memwatch_init(void) {
     const char *w = getenv("LARECOMP_WATCH");
+    if (w && getenv("LARECOMP_WATCH_AT")) {
+        CreateThread(NULL, 0, watch_at_thread, (LPVOID)(intptr_t)atol(getenv("LARECOMP_WATCH_AT")), 0, NULL);
+        w = NULL;
+    }
     if (w) {
         for (const char *p = w; *p;) {
             watch(strtoull(p, (char **)&p, 16));

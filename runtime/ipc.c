@@ -177,6 +177,15 @@ int ipc_handle_request(Cpu *c, uint32_t handle) {
         target->handler(target, &req, &resp);
         uint64_t dt = plat_now_ns() - t0;  // ([ipc] slow: a service that keeps the asking game thread waiting)
         if (dt > 20000000) LOG("[ipc] slow: %s cmd %u took %.1f ms\n", target->name, req.cmd, dt / 1e6);
+        // (research) LARECOMP_IPC_LOG=1: every request with its result, except the busy polling services (bsd, ldn, ssl,
+        // time, hwopus, audio); LARECOMP_IPC_LOG=all keeps those too
+        static int ipclog = -1;
+        if (ipclog < 0) { const char *v = getenv("LARECOMP_IPC_LOG"); ipclog = !v ? 0 : !strcmp(v, "all") ? 2 : 1; }
+        if (ipclog && (ipclog == 2 || !(strstr(target->name, "bsd") || strstr(target->name, "ldn") || strstr(target->name, "ssl") ||
+                                         strstr(target->name, "ITimeZone") || strstr(target->name, "hwopus") || strstr(target->name, "IHardwareOpus") ||
+                                         strstr(target->name, "audout") || strstr(target->name, "IAudioOut") || strstr(target->name, "ILocalCommunication") ||
+                                         strstr(target->name, "IUserLocal"))))
+            LOG("[ipclog] %s cmd %u in %u -> %x\n", target->name, req.cmd, req.data_size, resp.result);
     } else if (req.type == 5 || req.type == 7) {  // control
         req.cmd = *(uint32_t *)(payload + 8);
         LOG("[ipc] control %u on %s (handle %x)\n", req.cmd, sess->svc->name, handle);

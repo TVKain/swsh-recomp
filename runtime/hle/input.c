@@ -181,6 +181,7 @@ static bool test_event(const SDL_Event *e) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP: return e->key.which == TEST_DEVICE;
     case SDL_EVENT_TEXT_INPUT: return e->text.windowID == TEST_DEVICE;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP: return e->gbutton.which == TEST_DEVICE;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION: return e->gaxis.which == TEST_DEVICE;
     default: return false;
     }
 }
@@ -384,6 +385,7 @@ static void push_key(SDL_Scancode sc, SDL_Keymod mod, bool down) {
     e.key.key = SDL_GetKeyFromScancode(sc, mod, false);
     SDL_PushEvent(&e);
 }
+static uint64_t g_test_prev;  // (the last frame host_test_frame saw)
 static void test_push(uint64_t frame, unsigned long start, unsigned long len, const char *dev, const char *arg) {
     SDL_Event e;
     memset(&e, 0, sizeof e);
@@ -393,9 +395,36 @@ static void test_push(uint64_t frame, unsigned long start, unsigned long len, co
     }
     if (!strcmp(dev, "sdlpad")) {
         int b = bind_pad_from_name(arg);
-        if (b < 0 || b >= SDL_GAMEPAD_BUTTON_COUNT || (frame != start && frame != start + len)) return;
-        e.type = frame == start ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP;
-        e.gbutton.which = TEST_DEVICE, e.gbutton.button = (Uint8)b, e.gbutton.down = frame == start;
+        // (down / up when the frame number reaches them: a skipped number left the button held)
+        bool dn = g_test_prev < start && frame >= start, up = g_test_prev < start + len && frame >= start + len;
+        if (b < 0 || b >= SDL_GAMEPAD_BUTTON_COUNT || (!dn && !up)) return;
+        if (dn) {
+            e.type = SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+            e.gbutton.which = TEST_DEVICE, e.gbutton.button = (Uint8)b, e.gbutton.down = true;
+            SDL_PushEvent(&e);
+            if (!up) return;
+            memset(&e, 0, sizeof e);
+        }
+        e.type = SDL_EVENT_GAMEPAD_BUTTON_UP;
+        e.gbutton.which = TEST_DEVICE, e.gbutton.button = (Uint8)b, e.gbutton.down = false;
+        SDL_PushEvent(&e);
+        return;
+    }
+    if (!strcmp(dev, "sdlstk")) {  // "lx-" / "lx+" / "ly-" / "ly+": the left stick pushed like a thumb (ramps up over 3
+        // frames, held, let go) as SDL axis events - the menus' stick-as-d-pad path
+        if ((arg[0] != 'l' && arg[0] != 'r') || (arg[1] != 'x' && arg[1] != 'y')) return;
+        if (frame < start) return;
+        long k = (long)(frame - start);
+        float m;
+        if (k < 3) m = 0.3f * (float)(k + 1);
+        else if (k < (long)len) m = 1.0f;
+        else if (k < (long)len + 8) m = 0.0f;  // (let go: sent on several frames - a frame number can be skipped)
+        else return;
+        e.type = SDL_EVENT_GAMEPAD_AXIS_MOTION;
+        e.gaxis.which = TEST_DEVICE;
+        e.gaxis.axis = arg[0] == 'l' ? (arg[1] == 'x' ? SDL_GAMEPAD_AXIS_LEFTX : SDL_GAMEPAD_AXIS_LEFTY)
+                                     : (arg[1] == 'x' ? SDL_GAMEPAD_AXIS_RIGHTX : SDL_GAMEPAD_AXIS_RIGHTY);
+        e.gaxis.value = (Sint16)((arg[2] == '-' ? -m : m) * 32767.0f);
         SDL_PushEvent(&e);
         return;
     }
@@ -440,7 +469,7 @@ static void host_test_frame(uint64_t frame) {
             unsigned long start = 0, len = 10;
             char dev[8] = "", name[400] = "";
             if (sscanf(tok, "%lu:%7[a-z]:%399[^:]:%lu", &start, dev, name, &len) < 3) continue;
-            if (!strcmp(dev, "type") || !strcmp(dev, "sdlpad") || !strcmp(dev, "sdlkey") || !strcmp(dev, "shot")) {
+            if (!strcmp(dev, "type") || !strcmp(dev, "sdlpad") || !strcmp(dev, "sdlkey") || !strcmp(dev, "sdlstk") || !strcmp(dev, "shot")) {
                 test_push(frame, start, len, dev, name);
                 continue;
             }
@@ -512,6 +541,7 @@ void input_frame(uint64_t frame) {
     extern void watch_arm(void);
     watch_arm();
     host_test_frame(frame);
+    g_test_prev = frame;
     const char *spec = getenv("LARECOMP_INPUT");
     if (!spec) return;
     static const char *const names[] = {"A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R", "ZL", "ZR", "PLUS",

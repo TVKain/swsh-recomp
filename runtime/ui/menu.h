@@ -16,6 +16,11 @@ bool menu_handle_event(const SDL_Event *e);
 bool menu_is_open(void);
 // Main thread: apply window requests (fullscreen, text input) made from the overlay.
 void menu_apply_window_requests(void *sdl_window);
+// The start screen (its own ImGui context, current): a controller button / stick event as ImGui input, with A / B by the
+// controller layout as in game. True when it was one.
+bool menu_pad_to_imgui(const SDL_Event *e);
+// B (by the layout) or Esc going down
+bool menu_is_cancel_event(const SDL_Event *e);
 // Render thread, inside the window image's rendering (Vulkan command buffer cmd).
 void menu_render(void *cmd, uint32_t target_w, uint32_t target_h);
 

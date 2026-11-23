@@ -112,6 +112,26 @@ void rt_trace_store(uint64_t pc, uint64_t addr, uint64_t old, uint64_t nw, int s
     if (g_from < 0) return;
     long f = (long)renderer_present_count();
     if (f < g_from) return;
+    {   // LARECOMP_TRACE_FVAL=<v>[,<v>...]: in the window, each (instruction, address) that stores a 4-byte float within 0.01 of
+        // one of those values, once (where an animated value - a UI pane's position - is written)
+        static float fv[8];
+        static int nfv = -1;
+        if (nfv < 0) {
+            nfv = 0;
+            for (const char *p = getenv("LARECOMP_TRACE_FVAL"); p && *p && nfv < 8;) { fv[nfv++] = strtof(p, (char **)&p); while (*p == ',') p++; }
+        }
+        if (nfv && size == 4 && f >= g_from && f <= g_to) {
+            float fn; uint32_t un = (uint32_t)nw; memcpy(&fn, &un, 4);
+            for (int k = 0; k < nfv; k++)
+                if (fn > fv[k] - 0.01f && fn < fv[k] + 0.01f) {
+                    static uint64_t seen[512]; static int ns;
+                    uint64_t key = pc ^ (addr << 20);
+                    bool found = false;
+                    for (int j = 0; j < ns && !found; j++) found = seen[j] == key;
+                    if (!found && ns < 512) { seen[ns++] = key; LOG("[fval] present %ld pc %llx addr %llx = %g\n", f, (unsigned long long)pc, (unsigned long long)addr, (double)fn); }
+                }
+        }
+    }
     if (f > g_to) {
         if (!g_printed) {
             g_printed = true;
