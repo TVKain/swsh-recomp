@@ -91,15 +91,74 @@ this port has:
 an emulator's keys are found by themselves). Or a folder with the game already extracted (`exefs` and `romfs`).
 Keep about **60 GB** free for the one-time setup (about 20 GB stay used).
 
+### How to arrange your files
+
+**Option A: packed files from your Switch (easiest).** Put everything in one folder of its own. File names don't
+matter; the launcher tells the game, the update and the DLC apart by what is inside them.
+
+```
+D:\Switch\Pokemon Sword\          <- any folder you like
+├── Pokemon Sword.xci             the game: a cartridge dump (.xci) or the eShop base game (.nsp)
+├── Pokemon Sword v1.3.2.nsp      the 1.3.2 update (title id 0100ABF008968800)
+├── The Isle of Armor.nsp         optional: Expansion Pass DLC (0100ABF008969001)
+├── The Crown Tundra.nsp          optional: Expansion Pass DLC (0100ABF008969002)
+└── prod.keys                     your console keys, dumped from your own Switch
+```
+
+Then either click **Choose game files** and select all of them (Ctrl+A in the file dialog), or click **Use an
+extracted folder** and pick `D:\Switch\Pokemon Sword` itself: a folder holding `.xci` / `.nsp` files is unpacked the
+same way. A `prod.keys` in that folder is picked up by itself. If you use an emulator (Eden, Ryujinx, yuzu and its
+forks), its `prod.keys` is found without copying it. Compressed `.nsz` / `.xcz` files are not supported: decompress
+them first. Keep these files after the setup if you like, the program doesn't need them any more.
+
+**Option B: a game you already extracted** (with the 1.3.2 update applied, e.g. by nstool or an emulator's "dump
+RomFS / ExeFS"). Pick the folder that holds `exefs` and `romfs` (or any folder above it, up to five levels):
+
+```
+D:\Switch\Sword-extracted\
+├── exefs\
+│   ├── main
+│   ├── main.npdm
+│   ├── rtld
+│   ├── sdk
+│   ├── subsdk0
+│   └── subsdk1
+└── romfs\                        the game's RomFS (bin\, ...); a single romfs.bin image instead also works
+    └── bin\
+        └── ...
+```
+
+With Option B the DLC isn't set up for you: after the setup, put each DLC's `keyfile.dat` into the program's folder
+as `extracted\aoc\0100abf008969001\romfs\keyfile.dat` (The Isle of Armor) and
+`extracted\aoc\0100abf008969002\romfs\keyfile.dat` (The Crown Tundra). Or use Option A for everything.
+
+**After the setup** the program's folder (`%LOCALAPPDATA%\Programs\Pokemon Sword` with the installer, or where you
+unzipped it) looks like this. Don't move things around inside it:
+
+```
+Pokemon Sword\
+├── PokemonSword.exe              start here (the Start menu / desktop shortcut points to it)
+├── lasgen\  zig\  gamelib-src\   tools that recompile the game code during setup
+├── *.dll  nstool.exe  ...        the program's own files
+├── extracted\                    your game, set up: exefs\, romfs.bin, lasgame.dll (the recompiled code), aoc\ (DLC)
+├── keys\                         a copy of your prod.keys
+├── save-sword\                   your save: back this folder up
+├── cache\                        shader caches for your GPU (rebuilt if deleted)
+├── larecomp.ini                  settings
+├── mods\                         optional romfs mods (translations, textures)
+└── lasrecomp.log                 the log, for bug reports
+```
+
+### Install and set up
+
 1. Download **`PokemonSword-<version>-setup.exe`** from [Releases](../../releases) and run it. It installs for your
    user only, no administrator rights, into `%LOCALAPPDATA%\Programs\Pokemon Sword`. (Prefer no installer? Unzip
    `PokemonSword-<version>-windows.zip` into a folder you can write to.) The program isn't code-signed: if Windows
    warns, click **More info** → **Run anyway**.
 2. Open **Pokemon Sword Recomp** from the Start menu or the desktop.
 3. On the **Game** page click **Choose game files** and select everything at once with Ctrl+click: the game, the
-   update, the DLC and `prod.keys`. (A `prod.keys` in the same folder as the game files is picked up by itself; the
-   **Console keys** row shows whether keys were found and lets you choose a file.) With an extracted game, use
-   **Use an extracted folder** instead.
+   update, the DLC and `prod.keys` (or pick their folder with **Use an extracted folder**, see above). The **Console
+   keys** row shows whether keys were found and lets you choose a file.
 4. Wait while it unpacks the files and recompiles the game for your PC. This happens only once (about 20–60 minutes,
    depending on the CPU).
 5. Click **Play**.
