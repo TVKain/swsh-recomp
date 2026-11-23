@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.4.0 (2026-11-23) - TVKain fork
+
+### Easier to install
+- **Windows installer** (`PokemonSword-0.4.0-setup.exe`): installs for your user, no administrator rights, Start menu
+  and desktop shortcuts, an entry in Windows' Apps list. Uninstalling keeps saves, settings and keys.
+- **Set up straight from your Switch files**: pick the game (.xci / .nsp), the update, the DLC and your `prod.keys` all
+  at once. A `prod.keys` next to the game files is found by itself; the Game page's **Console keys** row shows whether
+  keys were found and lets you choose them. Keys are kept in `keys\`, so it's a one-time step.
+
+### Graphics
+- **Intel XeSS** anti-aliasing / upscaling on any GPU, including **Native AA (full size)**, the steadiest and sharpest
+  image; **TAA v2** (with an SMAA edge pass), clearly steadier than before.
+- **Per-object motion vectors**: no more ghosting / smearing on moving and animated characters with TAA or XeSS.
+- **Detail** preset (Balanced / High / Max) for shadows, ambient occlusion and texture filtering; outlines setting.
+- Intel Arc fixes: striped character bodies, the lawn over the court in the starter scene, a thin blue line at the top.
+- The chairman's close-up in the opening is no longer blurred (depth of field input).
+
+### 60 fps
+- Battles, message text, cutscenes, the crowd in the opening and the X menu (icons, held buttons, list scrolling, Town
+  Map cursor) run at the Switch's speed at 60 fps; battle inputs no longer need two presses.
+
+### Menus and controls
+- One settings layout for the start screen and in game, controller-first; hold View / Minus to open the settings in
+  game; menu sounds; Automatic controller layout (Nintendo / Xbox); VSync option; window / borderless / full screen.
+
+### Fixes
+- Mystery Gift no longer closes itself (local wireless and sockets answered like an offline Switch).
+- Characters no longer turn dark for a moment outdoors (tree-shade readback).
+- Includes upstream 0.3.2 and 0.3.3 (Poke Jobs time, integrated GPU memory limit).
+
+## 0.3.3 (2026-11-21)
+
+### Fixes
+- **Poke Jobs (and anything else timed by the game) count the time again** (#25: always "24 hours left"). The game
+  takes a snapshot of the clock when a job starts and measures the time spent against a later one; the port answered
+  the snapshot request with an empty one, in which no time ever passed. The clock the game uses to measure elapsed
+  time also goes on across sessions and PC restarts now (a restart set it back, which a game reads as the clock turned
+  back by hand).
+
+### For testers and developers
+- `LARECOMP_FIXED_TIME` gives the same game time in every run (it added the PC's uptime): scenario images and their
+  checks no longer change with the time of day.
+
+## 0.3.2 (2026-11-21)
+
+A fix for 0.3.1: **the text is back on AMD integrated GPUs** (Radeon Vega 6 / 7 / 8, #27, #4). 0.3.1's memory limit for
+integrated GPUs measured the wrong memory on AMD (the part the BIOS reserves for graphics, ~2 GB, instead of the
+system memory the game's memory is shared from) and shared only 768 MB of it with the GPU, which cut off the text.
+The limit now uses the memory the sharing really comes from and never goes below 2 GB.
+
+Not fixed yet: the stripes on characters on AMD GPUs (#4, #20, #22) - 0.3.1's change didn't remove them.
+
 ## 0.3.1 (2026-11-18)
 
 Fixes for AMD and Intel graphics, the Battle Tower and the Expansion Pass. Not yet confirmed on the players' own
